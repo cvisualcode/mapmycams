@@ -16,6 +16,110 @@ const OBJECT_PRESETS = [
   { id: 'door', label: 'Door', width: DOOR_WIDTH_METERS, blocksVision: true, color: '#f59e0b', resizable: false },
 ]
 
+// Camera quality presets used by the observable-range calculator (horizontal pixel counts)
+const RESOLUTIONS = [
+  { id: '720p', label: 'HD 720p', px: 1280 },
+  { id: '1080p', label: 'Full HD 1080p', px: 1920 },
+  { id: '2k', label: '2K · 3MP', px: 2048 },
+  { id: '4mp', label: '4K · 4MP', px: 2560 },
+  { id: '8mp', label: '4K Ultra · 8MP', px: 3840 },
+]
+
+// Minimum pixel density per metre of scene width for each identification goal
+const DETECTION_LEVELS = [
+  { id: 'detect', label: 'Detect', pxPerM: 25, hint: 'Spot a person or vehicle moving' },
+  { id: 'recognize', label: 'Recognize', pxPerM: 100, hint: 'Identify who or what it is' },
+  { id: 'identify', label: 'Identify', pxPerM: 250, hint: 'Read faces and number plates' },
+]
+
+// Stylized product artwork for the camera catalog (inline SVG data URIs, no network needed)
+function cameraSvg(accent, kind) {
+  let shape = ''
+  if (kind === 'dome') {
+    shape = `
+      <rect x="6" y="6" width="84" height="10" rx="3" fill="#334155"/>
+      <rect x="16" y="14" width="64" height="8" rx="2" fill="#475569"/>
+      <circle cx="48" cy="47" r="21" fill="${accent}"/>
+      <circle cx="48" cy="47" r="16" fill="#0f172a"/>
+      <circle cx="48" cy="47" r="7" fill="#38bdf8"/>
+      <circle cx="48" cy="47" r="3" fill="#e0f2fe"/>`
+  } else if (kind === 'bullet') {
+    shape = `
+      <rect x="8" y="14" width="8" height="46" rx="3" fill="#334155"/>
+      <rect x="14" y="22" width="20" height="30" rx="4" fill="#475569"/>
+      <rect x="32" y="16" width="56" height="42" rx="13" fill="${accent}"/>
+      <circle cx="54" cy="37" r="10" fill="#0f172a"/>
+      <circle cx="54" cy="37" r="6" fill="#38bdf8"/>
+      <circle cx="54" cy="37" r="2.4" fill="#e0f2fe"/>`
+  } else if (kind === 'turret') {
+    shape = `
+      <rect x="8" y="8" width="80" height="8" rx="3" fill="#334155"/>
+      <path d="M26 16 h44 l-5 12 h-34 z" fill="#475569"/>
+      <rect x="25" y="26" width="46" height="24" rx="7" fill="${accent}"/>
+      <circle cx="48" cy="38" r="9" fill="#0f172a"/>
+      <circle cx="48" cy="38" r="5.5" fill="#38bdf8"/>
+      <circle cx="48" cy="38" r="2.2" fill="#e0f2fe"/>`
+  } else {
+    shape = `
+      <rect x="34" y="6" width="28" height="9" rx="3" fill="#334155"/>
+      <rect x="42" y="15" width="12" height="10" fill="#475569"/>
+      <circle cx="48" cy="43" r="19" fill="${accent}"/>
+      <circle cx="48" cy="43" r="13" fill="#0f172a"/>
+      <circle cx="48" cy="43" r="6" fill="#38bdf8"/>
+      <circle cx="48" cy="43" r="2.6" fill="#e0f2fe"/>`
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 72">${shape}</svg>`
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
+}
+
+// Camera catalog. Fill in referralUrl with your affiliate link and the Buy button goes live.
+const CAMERA_CATALOG = [
+  {
+    id: 'indoor-dome',
+    name: 'Indoor Dome 2K',
+    kind: 'dome',
+    accent: '#4ade80',
+    resolutionLabel: '2K · 3MP',
+    fovLabel: '110°',
+    irLabel: 'IR 10 m',
+    rating: 'Indoor',
+    referralUrl: '',
+  },
+  {
+    id: 'outdoor-bullet',
+    name: 'Outdoor Bullet 4MP',
+    kind: 'bullet',
+    accent: '#60a5fa',
+    resolutionLabel: '4MP 2K',
+    fovLabel: '70°',
+    irLabel: 'IR 30 m',
+    rating: 'IP66',
+    referralUrl: '',
+  },
+  {
+    id: 'turret-2k',
+    name: '2K Turret Cam',
+    kind: 'turret',
+    accent: '#f472b6',
+    resolutionLabel: '4MP 2K',
+    fovLabel: '90°',
+    irLabel: 'IR 20 m',
+    rating: 'IP67',
+    referralUrl: '',
+  },
+  {
+    id: 'ptz-8mp',
+    name: 'PTZ 8MP',
+    kind: 'ptz',
+    accent: '#fbbf24',
+    resolutionLabel: '8MP 4K',
+    fovLabel: '30° zoom',
+    irLabel: 'IR 100 m',
+    rating: 'IP66',
+    referralUrl: '',
+  },
+]
+
 let nextId = 1
 
 function toCanvas(x, y, origin, pan, zoom) {
@@ -681,6 +785,32 @@ function App() {
   const [hoveredPoint, setHoveredPoint] = useState(null)
   const [windowDrag, setWindowDrag] = useState(null)
   const [lastClick, setLastClick] = useState(null)
+  const [showSidebar, setShowSidebar] = useState(true)
+  const [specFov, setSpecFov] = useState(90)
+  const [specResolution, setSpecResolution] = useState(RESOLUTIONS[1])
+  const [specGoal, setSpecGoal] = useState(DETECTION_LEVELS[0])
+
+  // Observable-range estimate: at distance D the camera sees a horizontal width of
+  // 2·D·tan(FOV/2). Divide the sensor's horizontal pixels by that width to get the
+  // pixel density (px/m) and solve for the distance that meets the chosen goal.
+  const fovRad = (specFov * Math.PI) / 180
+  const tanHalf = Math.tan(fovRad / 2)
+  const specRange = tanHalf > 0 ? specResolution.px / (2 * tanHalf * specGoal.pxPerM) : 0
+  const specWidth = 2 * specRange * tanHalf
+
+  // Keep the FOV slider in step with the camera currently selected on the plan
+  useEffect(() => {
+    if (selectedCamera) setSpecFov(Math.round(selectedCamera.hFov))
+  }, [selectedCamera ? selectedCamera.id : null])
+
+  function applySpecToSelected() {
+    if (!selectedCamera) return
+    const distance = Math.round(specRange * 10) / 10
+    setCameras((prev) =>
+      prev.map((c) => (c.id === selectedCamera.id ? { ...c, hFov: specFov, distance } : c)),
+    )
+    setSelectedCamera((prev) => (prev ? { ...prev, hFov: specFov, distance } : prev))
+  }
 
   const [size, setSize] = useState({ width: 800, height: 600 })
   const previousMode = useRef(mode)
@@ -1853,19 +1983,102 @@ function App() {
           <button onClick={resetView}>Reset View</button>
         </div>
       </div>
-      <div className="canvas-wrap" ref={containerRef}>
-        <canvas
-          ref={canvasRef}
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onMouseLeave={handleMouseUp}
-          onWheel={handleWheel}
-        />
-        <div className="zoom-controls">
-          <button onClick={zoomIn}>+</button>
-          <button onClick={zoomOut}>-</button>
+      <div className="workspace">
+        <div className="canvas-wrap" ref={containerRef}>
+          <canvas
+            ref={canvasRef}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseUp}
+            onWheel={handleWheel}
+          />
+          <div className="zoom-controls">
+            <button onClick={zoomIn}>+</button>
+            <button onClick={zoomOut}>-</button>
+          </div>
         </div>
+        <button
+          className={`side-tab${showSidebar ? ' open' : ''}`}
+          onClick={() => setShowSidebar((v) => !v)}
+          title="Camera specs and recommendations"
+        >
+          <svg className="tab-icon" viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true">
+            <path d="M2 7a2 2 0 0 1 2-2h1.2l1-2h7.6l1 2H16a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7Z" fill="currentColor" opacity="0.9"/>
+            <circle cx="10" cy="10.5" r="3.2" fill="#0f172a"/>
+            <circle cx="10" cy="10.5" r="1.5" fill="currentColor"/>
+          </svg>
+          <span>Cameras</span>
+        </button>
+        {showSidebar && (
+          <aside className="sidebar">
+            <div className="sidebar-header">
+              <h2>Camera planner</h2>
+            </div>
+            <section className="side-section">
+              <h3>Estimate observable range</h3>
+              <div className="spec-row">
+                <label>Field of view <span>{specFov}°</span></label>
+                <input type="range" min="5" max="180" step="1" value={specFov} onChange={(e) => setSpecFov(Number(e.target.value))} />
+              </div>
+              <div className="spec-row">
+                <label>Camera quality</label>
+                <select value={specResolution.id} onChange={(e) => setSpecResolution(RESOLUTIONS.find((r) => r.id === e.target.value))}>
+                  {RESOLUTIONS.map((r) => (
+                    <option key={r.id} value={r.id}>{r.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="spec-row">
+                <label>Identification goal</label>
+                <select value={specGoal.id} onChange={(e) => setSpecGoal(DETECTION_LEVELS.find((d) => d.id === e.target.value))}>
+                  {DETECTION_LEVELS.map((d) => (
+                    <option key={d.id} value={d.id}>{d.label}</option>
+                  ))}
+                </select>
+              </div>
+              <p className="spec-hint">{specGoal.hint}</p>
+              <div className="range-result">
+                <div className="range-big">{specRange > 0 ? `${specRange.toFixed(1)} m` : '—'}</div>
+                <div className="range-meta">field width ≈ {specWidth.toFixed(1)} m at that distance</div>
+              </div>
+              <div className="apply-row">
+                {selectedCamera ? (
+                  <button className="apply-btn" onClick={applySpecToSelected}>
+                    Apply to {selectedCamera.label}
+                  </button>
+                ) : (
+                  <span className="apply-hint">Select a camera on the plan to apply these specs</span>
+                )}
+              </div>
+            </section>
+            <section className="side-section">
+              <h3>Recommended cameras</h3>
+              <p className="spec-hint">Paste your affiliate links into each camera below to turn on the Buy button.</p>
+              <div className="cam-list">
+                {CAMERA_CATALOG.map((c) => (
+                  <div className="cam-card" key={c.id}>
+                    <img className="cam-img" src={cameraSvg(c.accent, c.kind)} alt={c.name} />
+                    <div className="cam-info">
+                      <div className="cam-name">{c.name}</div>
+                      <div className="cam-tags">
+                        <span>{c.resolutionLabel}</span>
+                        <span>{c.fovLabel}</span>
+                        <span>{c.irLabel}</span>
+                        <span>{c.rating}</span>
+                      </div>
+                      {c.referralUrl ? (
+                        <a className="cam-buy" href={c.referralUrl} target="_blank" rel="noreferrer">Buy</a>
+                      ) : (
+                        <span className="cam-buy pending" title="Add your affiliate link to CAMERA_CATALOG in src/App.jsx">Buy — link soon</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </aside>
+        )}
       </div>
     </div>
   )
