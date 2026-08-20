@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import './App.css'
 
 const PIXELS_PER_METER = 40
+const DOOR_WIDTH_METERS = 0.9
 const PRESETS = [
   { id: 'indoor-wide', label: 'Indoor Wide', hFov: 90, distance: 8, color: '#4ade80' },
   { id: 'outdoor-bullet', label: 'Outdoor Bullet', hFov: 70, distance: 20, color: '#60a5fa' },
@@ -12,7 +13,7 @@ const PRESETS = [
 const OBJECT_PRESETS = [
   { id: 'safe', label: 'Safe', width: 0.6, height: 0.5, blocksVision: true, color: '#ef4444' },
   { id: 'window', label: 'Window', width: 1.2, height: 0.1, blocksVision: false, color: '#3b82f6', resizable: true },
-  { id: 'door', label: 'Door', width: 1, blocksVision: true, color: '#f59e0b', resizable: false },
+  { id: 'door', label: 'Door', width: DOOR_WIDTH_METERS, blocksVision: true, color: '#f59e0b', resizable: false },
 ]
 
 let nextId = 1
@@ -34,13 +35,15 @@ function toWorld(x, y, origin, pan, zoom) {
 function getDoorSegmentWorld(door, wall) {
   const p1 = wall.points[door.segmentIndex]
   const p2 = wall.points[(door.segmentIndex + 1) % wall.points.length]
+  const hingeT = door.hingeSide === 'left' ? door.t1 : door.t2
+  const startT = door.hingeSide === 'left' ? door.t2 : door.t1
   const hinge = {
-    x: p1.x + (p2.x - p1.x) * door.t2,
-    y: p1.y + (p2.y - p1.y) * door.t2,
+    x: p1.x + (p2.x - p1.x) * hingeT,
+    y: p1.y + (p2.y - p1.y) * hingeT,
   }
   const start = {
-    x: p1.x + (p2.x - p1.x) * door.t1,
-    y: p1.y + (p2.y - p1.y) * door.t1,
+    x: p1.x + (p2.x - p1.x) * startT,
+    y: p1.y + (p2.y - p1.y) * startT,
   }
   const wallAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x)
   const rel = ((door.rotation * Math.PI) / 180) - wallAngle
@@ -116,33 +119,42 @@ function drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, extraWalls) {
         const u = ((ep1x - start.x) * dy - (ep1y - start.y) * dx) / denom
         if (t > 0 && u >= -0.01 && u <= 1.01) {
           const segWindows = windows.filter((w) => w.segmentIndex === j)
+          const segDoors = doors.filter((d) => d.segmentIndex === j)
           const hitInWindow = segWindows.some((w) => u >= w.t1 && u <= w.t2)
-          if (hitInWindow) continue
+          const hitInDoorOpening = segDoors.some((door) => u >= door.t1 && u <= door.t2)
 
-          for (const door of doors.filter((d) => d.segmentIndex === j)) {
-            const doorSeg = getDoorSegmentWorld(door, wall)
-            const d1 = toCanvas(doorSeg.start.x, doorSeg.start.y, origin, pan, zoom)
-            const d2 = toCanvas(doorSeg.end.x, doorSeg.end.y, origin, pan, zoom)
-            const dSegDx = d2.x - d1.x
-            const dSegDy = d2.y - d1.y
-            const dDenom = dx * dSegDy - dy * dSegDx
-            if (Math.abs(dDenom) < 1e-8) continue
-            const dT = ((d1.x - start.x) * dSegDy - (d1.y - start.y) * dSegDx) / dDenom
-            const dU = ((d1.x - start.x) * dy - (d1.y - start.y) * dx) / dDenom
-            if (dT > 0 && dU >= 0 && dU <= 1) {
-              if (dT < nearest && dT > 0) nearest = dT
-            }
+          // Windows and doors replace this part of the wall. The door leaf is
+          // tested independently below, so the opening itself must not keep
+          // the original wall segment in the ray path.
+          if (!hitInWindow && !hitInDoorOpening && t < nearest) {
+            nearest = t
           }
+        }
 
-          const hitDist = t
-          if (hitDist < nearest && hitDist > 0) {
-            nearest = hitDist
+        // A swung door can extend away from its wall, so test the door leaf
+        // independently of the wall intersection. This makes the visible door
+        // geometry the thing that blocks the FOV ray.
+        for (const door of doors.filter((d) => d.segmentIndex === j)) {
+          const doorSeg = getDoorSegmentWorld(door, wall)
+          const d1 = toCanvas(doorSeg.start.x, doorSeg.start.y, origin, pan, zoom)
+          const d2 = toCanvas(doorSeg.end.x, doorSeg.end.y, origin, pan, zoom)
+          const dSegDx = d2.x - d1.x
+          const dSegDy = d2.y - d1.y
+          const dDenom = dx * dSegDy - dy * dSegDx
+          if (Math.abs(dDenom) < 1e-8) continue
+          const dT = ((d1.x - start.x) * dSegDy - (d1.y - start.y) * dSegDx) / dDenom
+          const dU = ((d1.x - start.x) * dy - (d1.y - start.y) * dx) / dDenom
+          if (dT > 0 && dU >= 0 && dU <= 1 && dT < nearest) {
+            nearest = dT
           }
         }
       }
     }
 
     for (const obj of objects) {
+      // Wall-attached doors are handled as their swung leaf above; they do not
+      // have a free-standing x/y rectangle to test here.
+      if (obj.presetId === 'door' && obj.wallId != null) continue
       if (!obj.blocksVision) continue
       const preset = OBJECT_PRESETS.find((p) => p.id === obj.presetId)
       if (!preset) continue
@@ -201,6 +213,40 @@ function drawSegmentLine(ctx, p1, p2, origin, pan, zoom) {
   ctx.stroke()
 }
 
+function formatMeasurement(meters) {
+  const rounded = Math.round(meters * 100) / 100
+  return `${rounded.toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1')} m`
+}
+
+function drawMeasurementLabel(ctx, text, x, y, zoom) {
+  ctx.save()
+  ctx.font = `${Math.max(10, 12 * zoom)}px system-ui, sans-serif`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.lineJoin = 'round'
+  ctx.lineWidth = 4
+  ctx.strokeStyle = 'rgba(248, 250, 252, 0.95)'
+  ctx.strokeText(text, x, y)
+  ctx.fillStyle = '#334155'
+  ctx.fillText(text, x, y)
+  ctx.restore()
+}
+
+function drawSegmentMeasurement(ctx, p1, p2, origin, pan, zoom) {
+  const worldLength = Math.hypot(p2.x - p1.x, p2.y - p1.y)
+  if (worldLength < 0.05) return
+  const c1 = toCanvas(p1.x, p1.y, origin, pan, zoom)
+  const c2 = toCanvas(p2.x, p2.y, origin, pan, zoom)
+  const dx = c2.x - c1.x
+  const dy = c2.y - c1.y
+  const canvasLength = Math.hypot(dx, dy)
+  if (canvasLength < 8) return
+  const offset = Math.max(12, 14 * zoom)
+  const midX = (c1.x + c2.x) / 2 - (dy / canvasLength) * offset
+  const midY = (c1.y + c2.y) / 2 + (dx / canvasLength) * offset
+  drawMeasurementLabel(ctx, formatMeasurement(worldLength / PIXELS_PER_METER), midX, midY, zoom)
+}
+
 function drawRoomLabel(ctx, wall, origin, pan, zoom) {
   if (wall.points.length < 3) return
   let cx = 0, cy = 0
@@ -218,7 +264,7 @@ function drawRoomLabel(ctx, wall, origin, pan, zoom) {
   ctx.fillText(wall.label || 'Room', cx, cy)
 }
 
-function drawRectangle(ctx, x1, y1, x2, y2, zoom) {
+function drawRectangle(ctx, x1, y1, x2, y2, zoom, widthMeters, heightMeters) {
   ctx.beginPath()
   ctx.rect(x1, y1, x2 - x1, y2 - y1)
   ctx.strokeStyle = '#111827'
@@ -226,10 +272,17 @@ function drawRectangle(ctx, x1, y1, x2, y2, zoom) {
   ctx.stroke()
   ctx.fillStyle = 'rgba(17, 24, 39, 0.05)'
   ctx.fill()
+
+  if (widthMeters != null && heightMeters != null) {
+    const offset = Math.max(14, 16 * zoom)
+    drawMeasurementLabel(ctx, formatMeasurement(widthMeters), (x1 + x2) / 2, Math.min(y1, y2) - offset, zoom)
+    drawMeasurementLabel(ctx, formatMeasurement(heightMeters), Math.max(x1, x2) + offset, (y1 + y2) / 2, zoom)
+  }
 }
 
 function drawGrid(ctx, width, height, pan, zoom) {
-  const step = 50 * zoom
+  // One visible grid square represents one metre.
+  const step = PIXELS_PER_METER * zoom
   if (step < 8) return
   ctx.strokeStyle = '#e5e7eb'
   ctx.lineWidth = 1
@@ -287,8 +340,9 @@ function isOnDoorHandle(canvasX, canvasY, obj, walls, origin, pan, zoom) {
     if (!wall) return false
     const p1 = wall.points[obj.segmentIndex]
     const p2 = wall.points[(obj.segmentIndex + 1) % wall.points.length]
-    const hx = p1.x + (p2.x - p1.x) * obj.t2
-    const hy = p1.y + (p2.y - p1.y) * obj.t2
+    const hingeT = obj.hingeSide === 'left' ? obj.t1 : obj.t2
+    const hx = p1.x + (p2.x - p1.x) * hingeT
+    const hy = p1.y + (p2.y - p1.y) * hingeT
     const cp = toCanvas(hx, hy, origin, pan, zoom)
     hingeCanvasX = cp.x
     hingeCanvasY = cp.y
@@ -297,7 +351,8 @@ function isOnDoorHandle(canvasX, canvasY, obj, walls, origin, pan, zoom) {
     hingeCanvasX = cp.x + Math.cos((obj.rotation * Math.PI) / 180) * half
     hingeCanvasY = cp.y + Math.sin((obj.rotation * Math.PI) / 180) * half
   }
-  const handleAngle = (obj.rotation * Math.PI) / 180 + Math.PI / 2
+  const hingeDirection = obj.hingeSide === 'left' ? -1 : 1
+  const handleAngle = (obj.rotation * Math.PI) / 180 + hingeDirection * Math.PI / 2
   const handleX = hingeCanvasX + half * Math.cos(handleAngle)
   const handleY = hingeCanvasY + half * Math.sin(handleAngle)
   // allow clicking either the handle on the arc or the hinge pivot itself
@@ -356,7 +411,7 @@ function drawWindowOnWallSegment(ctx, x1, y1, x2, y2, origin, pan, zoom) {
   ctx.stroke()
 }
 
-function drawDoorOnWallSegment(ctx, x1, y1, x2, y2, rotation, origin, pan, zoom) {
+function drawDoorOnWallSegment(ctx, x1, y1, x2, y2, rotation, origin, pan, zoom, hingeSide = 'right') {
   const start = toCanvas(x1, y1, origin, pan, zoom)
   const end = toCanvas(x2, y2, origin, pan, zoom)
   const wallAngle = Math.atan2(y2 - y1, x2 - x1)
@@ -368,12 +423,14 @@ function drawDoorOnWallSegment(ctx, x1, y1, x2, y2, rotation, origin, pan, zoom)
   const nx = -dy / len * 4 * zoom
   const ny = dx / len * 4 * zoom
 
-  // pivot at the segment end (hinge)
-  const pivotX = end.x
-  const pivotY = end.y
-  // vector from hinge to closed door start
-  const vx = start.x - pivotX
-  const vy = start.y - pivotY
+  // The default hinge is on the segment's right/end side. For a left hinge,
+  // pivot at the opposite end and swing toward the other door endpoint.
+  const pivotX = hingeSide === 'left' ? start.x : end.x
+  const pivotY = hingeSide === 'left' ? start.y : end.y
+  const closedStartX = hingeSide === 'left' ? end.x : start.x
+  const closedStartY = hingeSide === 'left' ? end.y : start.y
+  const vx = closedStartX - pivotX
+  const vy = closedStartY - pivotY
   const rel = doorAngle - wallAngle
   const cosR = Math.cos(rel)
   const sinR = Math.sin(rel)
@@ -409,6 +466,7 @@ function drawWall(ctx, wall, origin, pan, zoom, objects) {
     const nextI = closed ? (i + 1) % wall.points.length : i + 1
     if (nextI >= wall.points.length) break
     const p2 = wall.points[nextI]
+    drawSegmentMeasurement(ctx, p1, p2, origin, pan, zoom)
     const segmentWindows = windows
       .filter((obj) => obj.segmentIndex === i)
       .sort((a, b) => a.t1 - b.t1)
@@ -431,7 +489,7 @@ function drawWall(ctx, wall, origin, pan, zoom, objects) {
       } else if (segObj.presetId === 'door') {
         drawDoorOnWallSegment(ctx, p1.x + (p2.x - p1.x) * segObj.t1, p1.y + (p2.y - p1.y) * segObj.t1,
           p1.x + (p2.x - p1.x) * segObj.t2, p1.y + (p2.y - p1.y) * segObj.t2,
-          segObj.rotation, origin, pan, zoom)
+          segObj.rotation, origin, pan, zoom, segObj.hingeSide)
       }
       lastT = segObj.t2
     }
@@ -491,7 +549,7 @@ function drawObject(ctx, obj, origin, pan, zoom, walls) {
     const y1 = p1.y + (p2.y - p1.y) * obj.t1
     const x2 = p1.x + (p2.x - p1.x) * obj.t2
     const y2 = p1.y + (p2.y - p1.y) * obj.t2
-    drawDoorOnWallSegment(ctx, x1, y1, x2, y2, obj.rotation, origin, pan, zoom)
+    drawDoorOnWallSegment(ctx, x1, y1, x2, y2, obj.rotation, origin, pan, zoom, obj.hingeSide)
     return
   }
 
@@ -625,6 +683,108 @@ function App() {
   const [lastClick, setLastClick] = useState(null)
 
   const [size, setSize] = useState({ width: 800, height: 600 })
+  const previousMode = useRef(mode)
+
+  useEffect(() => {
+    if (previousMode.current === 'wall' && mode !== 'wall' && currentWall) {
+      if (currentWall.points.length >= 2) {
+        setWalls((prev) => [...prev, { ...currentWall, closed: false }])
+      }
+      setCurrentWall(null)
+    }
+    previousMode.current = mode
+    setSelectedCamera(null)
+    setSelectedObject(null)
+    setRotateDrag(false)
+    setDrag(null)
+  }, [mode])
+
+  useEffect(() => {
+    const host = document.body
+    if (!host) return undefined
+
+    const existing = host.querySelector('[data-door-hinge-control]')
+    if (existing) existing.remove()
+
+    if (!selectedObject || selectedObject.presetId !== 'door' || selectedObject.wallId == null) {
+      return undefined
+    }
+
+    const wrapper = document.createElement('label')
+    wrapper.style.position = 'fixed'
+    wrapper.style.top = '12px'
+    wrapper.style.left = '50%'
+    wrapper.style.transform = 'translateX(-50%)'
+    wrapper.style.zIndex = '20'
+    wrapper.style.background = '#ffffff'
+    wrapper.style.padding = '8px 12px'
+    wrapper.style.borderRadius = '8px'
+    wrapper.style.boxShadow = '0 4px 16px rgba(15, 23, 42, 0.18)'
+    wrapper.dataset.doorHingeControl = 'true'
+    wrapper.textContent = 'Hinge: '
+    const select = document.createElement('select')
+    select.setAttribute('aria-label', 'Door hinge side')
+    select.innerHTML = '<option value="left">Left</option><option value="right">Right</option>'
+    select.value = selectedObject.hingeSide || 'right'
+    select.addEventListener('change', (event) => {
+      const hingeSide = event.target.value
+      setObjects((prev) => prev.map((obj) => (
+        obj.id === selectedObject.id ? { ...obj, hingeSide } : obj
+      )))
+      setSelectedObject((prev) => (
+        prev && prev.id === selectedObject.id ? { ...prev, hingeSide } : prev
+      ))
+    })
+    wrapper.appendChild(select)
+    host.appendChild(wrapper)
+
+    return () => wrapper.remove()
+  }, [selectedObject?.id, selectedObject?.hingeSide, mode])
+
+  useEffect(() => {
+    if (!rotateDrag || !rotateDrag.objectId) return undefined
+
+    const smoothDoorRotation = (event) => {
+      const door = objects.find((obj) => obj.id === rotateDrag.objectId)
+      if (!door) return
+
+      const world = getMouseWorld(event)
+      const currentAngle = Math.atan2(world.y - rotateDrag.centerY, world.x - rotateDrag.centerX)
+      const delta = Math.atan2(
+        Math.sin(currentAngle - rotateDrag.startAngle),
+        Math.cos(currentAngle - rotateDrag.startAngle),
+      )
+      const proposedRotation = rotateDrag.startRotation + (delta * 180 / Math.PI)
+
+      let baseAngle = rotateDrag.startRotation
+      if (door.wallId != null) {
+        const wall = walls.find((candidate) => candidate.id === door.wallId)
+        if (wall) {
+          const p1 = wall.points[door.segmentIndex]
+          const p2 = wall.points[(door.segmentIndex + 1) % wall.points.length]
+          baseAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x) * 180 / Math.PI
+        }
+      }
+
+      let relative = proposedRotation - baseAngle
+      relative = ((relative + 180) % 360 + 360) % 360 - 180
+      const clampedRelative = Math.max(-90, Math.min(90, relative))
+      const targetRotation = ((baseAngle + clampedRelative) % 360 + 360) % 360
+      const currentRotation = door.rotation || 0
+      const shortestStep = ((targetRotation - currentRotation + 540) % 360) - 180
+      const nextRotation = ((currentRotation + shortestStep * 0.45) % 360 + 360) % 360
+
+      setObjects((prev) => prev.map((obj) => (
+        obj.id === rotateDrag.objectId ? { ...obj, rotation: nextRotation } : obj
+      )))
+      setSelectedObject((prev) => (
+        prev && prev.id === rotateDrag.objectId ? { ...prev, rotation: nextRotation } : prev
+      ))
+    }
+
+    document.addEventListener('mousemove', smoothDoorRotation)
+    return () => document.removeEventListener('mousemove', smoothDoorRotation)
+  }, [rotateDrag, objects, walls, origin, pan, zoom])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -707,9 +867,9 @@ function App() {
       if (wall && wall.points.length >= 2) {
         const p1 = wall.points[selectedObject.segmentIndex]
         const p2 = wall.points[(selectedObject.segmentIndex + 1) % wall.points.length]
-        // hinge is at t2 (right side of door)
-        const hxWorld = p1.x + (p2.x - p1.x) * selectedObject.t2
-        const hyWorld = p1.y + (p2.y - p1.y) * selectedObject.t2
+        const hingeT = selectedObject.hingeSide === 'left' ? selectedObject.t1 : selectedObject.t2
+        const hxWorld = p1.x + (p2.x - p1.x) * hingeT
+        const hyWorld = p1.y + (p2.y - p1.y) * hingeT
         const hinge = toCanvas(hxWorld, hyWorld, origin, pan, zoom)
         const rot = (selectedObject.rotation * Math.PI) / 180
         const wpx = (selectedObject.width || OBJECT_PRESETS.find((p) => p.id === 'door').width) * PIXELS_PER_METER * zoom
@@ -720,11 +880,18 @@ function App() {
         ctx.strokeStyle = '#3b82f6'
         ctx.lineWidth = 2
         // arc centered on hinge so swing visually matches pivot
-        ctx.arc(hinge.x, hinge.y, radius, rot + Math.PI / 2, rot - Math.PI / 2)
+        const hingeDirection = selectedObject.hingeSide === 'left' ? -1 : 1
+        ctx.arc(
+          hinge.x,
+          hinge.y,
+          radius,
+          rot + hingeDirection * Math.PI / 2,
+          rot - hingeDirection * Math.PI / 2,
+        )
         ctx.stroke()
         ctx.setLineDash([])
 
-        const handleAngle = rot + Math.PI / 2
+        const handleAngle = rot + hingeDirection * Math.PI / 2
         const handleX = hinge.x + radius * Math.cos(handleAngle)
         const handleY = hinge.y + radius * Math.sin(handleAngle)
 
@@ -778,8 +945,9 @@ function App() {
           if (!wall) continue
           const p1 = wall.points[obj.segmentIndex]
           const p2 = wall.points[(obj.segmentIndex + 1) % wall.points.length]
-          hxWorld = p1.x + (p2.x - p1.x) * obj.t2
-          hyWorld = p1.y + (p2.y - p1.y) * obj.t2
+          const hingeT = obj.hingeSide === 'left' ? obj.t1 : obj.t2
+          hxWorld = p1.x + (p2.x - p1.x) * hingeT
+          hyWorld = p1.y + (p2.y - p1.y) * hingeT
         } else {
           const rot = (obj.rotation * Math.PI) / 180
           hxWorld = obj.x + (obj.width || OBJECT_PRESETS.find((p) => p.id === 'door').width) / 2 * Math.cos(rot)
@@ -836,7 +1004,16 @@ function App() {
     if (rectStart && rectEnd) {
       const p1 = toCanvas(rectStart.x, rectStart.y, origin, pan, zoom)
       const p2 = toCanvas(rectEnd.x, rectEnd.y, origin, pan, zoom)
-      drawRectangle(ctx, p1.x, p1.y, p2.x, p2.y, zoom)
+      drawRectangle(
+        ctx,
+        p1.x,
+        p1.y,
+        p2.x,
+        p2.y,
+        zoom,
+        Math.abs(rectEnd.x - rectStart.x) / PIXELS_PER_METER,
+        Math.abs(rectEnd.y - rectStart.y) / PIXELS_PER_METER,
+      )
     }
 
     if (currentWall) {
@@ -866,6 +1043,7 @@ function App() {
   function handleMouseDown(e) {
     const world = getMouseWorld(e)
     const c = getMouseCanvas(e)
+
     // show a brief click marker for debugging selection
     setLastClick({ x: c.x, y: c.y })
     setTimeout(() => setLastClick(null), 800)
@@ -905,8 +1083,9 @@ function App() {
             const wall = walls.find((w) => w.id === obj.wallId)
             const p1 = wall.points[obj.segmentIndex]
             const p2 = wall.points[(obj.segmentIndex + 1) % wall.points.length]
-            hingeX = p1.x + (p2.x - p1.x) * obj.t2
-            hingeY = p1.y + (p2.y - p1.y) * obj.t2
+            const hingeT = obj.hingeSide === 'left' ? obj.t1 : obj.t2
+            hingeX = p1.x + (p2.x - p1.x) * hingeT
+            hingeY = p1.y + (p2.y - p1.y) * hingeT
           } else {
             hingeX = obj.x + half * Math.cos(rot)
             hingeY = obj.y + half * Math.sin(rot)
@@ -925,8 +1104,9 @@ function App() {
           if (!wall) continue
           const p1 = wall.points[obj.segmentIndex]
           const p2 = wall.points[(obj.segmentIndex + 1) % wall.points.length]
-          const hx = p1.x + (p2.x - p1.x) * obj.t2
-          const hy = p1.y + (p2.y - p1.y) * obj.t2
+          const hingeT = obj.hingeSide === 'left' ? obj.t1 : obj.t2
+          const hx = p1.x + (p2.x - p1.x) * hingeT
+          const hy = p1.y + (p2.y - p1.y) * hingeT
           const hingeCanvas = toCanvas(hx, hy, origin, pan, zoom)
           // use rotation relative to the wall so hit-test matches drawDoorOnWallSegment
           const wallAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x)
@@ -940,7 +1120,9 @@ function App() {
           const sinR = Math.sin(rot)
           const localX = dxH * cosR + dyH * sinR
           const localY = -dxH * sinR + dyH * cosR
-          if (localX >= -wpx - 4 && localX <= 4 && localY >= -hpx / 2 - 4 && localY <= hpx / 2 + 4) {
+          const minLocalX = obj.hingeSide === 'left' ? -4 : -wpx - 4
+          const maxLocalX = obj.hingeSide === 'left' ? wpx + 4 : 4
+          if (localX >= minLocalX && localX <= maxLocalX && localY >= -hpx / 2 - 4 && localY <= hpx / 2 + 4) {
             setSelectedObject(obj)
             setSelectedRoom(null)
             setSelectedCamera(null)
@@ -965,7 +1147,9 @@ function App() {
           const sinR = Math.sin(rot)
           const localX = dx * cosR + dy * sinR
           const localY = -dx * sinR + dy * cosR
-          if (localX >= -wpx - 4 && localX <= 4 && localY >= -hpx / 2 - 4 && localY <= hpx / 2 + 4) {
+          const minLocalX = obj.hingeSide === 'left' ? -4 : -wpx - 4
+          const maxLocalX = obj.hingeSide === 'left' ? wpx + 4 : 4
+          if (localX >= minLocalX && localX <= maxLocalX && localY >= -hpx / 2 - 4 && localY <= hpx / 2 + 4) {
             objHit = obj
             break
           }
@@ -988,7 +1172,7 @@ function App() {
             const p1 = wall.points[hit.segmentIndex]
             const p2 = wall.points[(hit.segmentIndex + 1) % wall.points.length]
             const segLen = Math.hypot(p2.x - p1.x, p2.y - p1.y)
-            const doorWidthPx = 1 * PIXELS_PER_METER
+            const doorWidthPx = DOOR_WIDTH_METERS * PIXELS_PER_METER
             const halfDoor = doorWidthPx / 2 / segLen
             const t1 = Math.max(0, hit.t - halfDoor)
             const t2 = Math.min(1, hit.t + halfDoor)
@@ -1001,6 +1185,7 @@ function App() {
               t1,
               t2,
               rotation: wallAngle,
+              hingeSide: 'right',
             }])
           }
         }
@@ -1112,8 +1297,9 @@ function App() {
           if (!wall) continue
           const p1 = wall.points[obj.segmentIndex]
           const p2 = wall.points[(obj.segmentIndex + 1) % wall.points.length]
-          const hx = p1.x + (p2.x - p1.x) * obj.t2
-          const hy = p1.y + (p2.y - p1.y) * obj.t2
+          const hingeT = obj.hingeSide === 'left' ? obj.t1 : obj.t2
+          const hx = p1.x + (p2.x - p1.x) * hingeT
+          const hy = p1.y + (p2.y - p1.y) * hingeT
           const hingeCanvas = toCanvas(hx, hy, origin, pan, zoom)
           // rotation relative to the wall segment so hit-test matches drawn door
           const wallAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x)
@@ -1129,7 +1315,9 @@ function App() {
           const localX = dxH * cosR + dyH * sinR
           const localY = -dxH * sinR + dyH * cosR
           // allow a small padding for easier clicking
-          if (localX >= -wpx - 12 && localX <= 12 && localY >= -hpx / 2 - 12 && localY <= hpx / 2 + 12) {
+          const minLocalX = obj.hingeSide === 'left' ? -12 : -wpx - 12
+          const maxLocalX = obj.hingeSide === 'left' ? wpx + 12 : 12
+          if (localX >= minLocalX && localX <= maxLocalX && localY >= -hpx / 2 - 12 && localY <= hpx / 2 + 12) {
             objHit = obj
             break
           }
