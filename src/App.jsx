@@ -8,13 +8,92 @@ const PRESETS = [
   { id: 'outdoor-bullet', label: 'Outdoor Bullet', hFov: 70, distance: 20, color: '#60a5fa' },
   { id: 'dome', label: 'Dome', hFov: 110, distance: 10, color: '#f472b6' },
   { id: 'ptz', label: 'PTZ', hFov: 30, distance: 50, color: '#fbbf24' },
-]
-
+];
 const OBJECT_PRESETS = [
   { id: 'safe', label: 'Safe', width: 0.6, height: 0.5, blocksVision: true, color: '#ef4444' },
   { id: 'window', label: 'Window', width: 1.2, height: 0.1, blocksVision: false, color: '#3b82f6', resizable: true },
   { id: 'door', label: 'Door', width: DOOR_WIDTH_METERS, blocksVision: true, color: '#f59e0b', resizable: false },
+  { id: 'power', label: 'Power Outlet', width: 0.3, height: 0.3, blocksVision: false, color: '#facc15', isPowerSource: true },
+  { id: 'stairs-straight', label: 'Stairs · Straight', width: 1.1, height: 0.35, blocksVision: false, color: '#8b5cf6' },
+  { id: 'stairs-curved', label: 'Stairs · Curved', width: 1.3, height: 1.3, blocksVision: false, color: '#a78bfa' },
 ]
+
+// Free end-points that wires can snap to. Cameras use cam-<id>, power outlets use power-<id>.
+const SNAP_RADIUS_PX = 18
+const FLOOR_NAMES = ['Ground', 'First', 'Second', 'Roof']
+const FLOOR_COLORS = ['#64748b', '#6366f1', '#d97706', '#0ea5e9']
+const METERS_PER_STORY = 2.6
+
+function endpointId(kind, id) {
+  return kind === 'cam' ? `cam-${id}` : kind === 'power' ? `power-${id}` : null
+}
+
+function findSnapTarget(world, cameras, objects, origin, pan, zoom) {
+  let best = null
+  let bestDist = SNAP_RADIUS_PX
+  for (const cam of cameras) {
+    const cp = toCanvas(cam.x, cam.y, origin, pan, zoom)
+    const d = Math.hypot(cp.x - world.canvasX, cp.y - world.canvasY)
+    if (d < bestDist) {
+      bestDist = d
+      best = { kind: 'cam', id: cam.id, x: cam.x, y: cam.y, label: cam.label || 'Cam' }
+    }
+  }
+  for (const obj of objects) {
+    const preset = OBJECT_PRESETS.find((p) => p.id === obj.presetId)
+    if (!preset || !preset.isPowerSource) continue
+    if (obj.wallId != null) continue
+    const cp = toCanvas(obj.x, obj.y, origin, pan, zoom)
+    const d = Math.hypot(cp.x - world.canvasX, cp.y - world.canvasY)
+    if (d < bestDist) {
+      bestDist = d
+      best = { kind: 'power', id: obj.id, x: obj.x, y: obj.y, label: 'Outlet' }
+    }
+  }
+  return best
+}
+
+// Adjacency map: each endpoint id is linked to every endpoint it's wired to.
+function buildPowerAdjacency(wires) {
+  const adj = new Map()
+  const ensure = (id) => { if (!adj.has(id)) adj.set(id, new Set()); return adj.get(id) }
+  for (const w of wires) {
+    const a = w.snapStartId
+    const b = w.snapEndId
+    if (!a || !b || a === b) continue
+    ensure(a).add(b)
+    ensure(b).add(a)
+  }
+  return adj
+}
+
+function computePoweredCameraIds(cameras, objects, wires) {
+  const sources = []
+  for (const obj of objects) {
+    const preset = OBJECT_PRESETS.find((p) => p.id === obj.presetId)
+    if (preset && preset.isPowerSource) sources.push(endpointId('power', obj.id))
+  }
+  if (sources.length === 0) return new Set()
+  const adj = buildPowerAdjacency(wires)
+  const reachable = new Set(sources)
+  const queue = [...sources]
+  while (queue.length) {
+    const cur = queue.shift()
+    const neighbours = adj.get(cur)
+    if (!neighbours) continue
+    for (const nb of neighbours) {
+      if (!reachable.has(nb)) {
+        reachable.add(nb)
+        queue.push(nb)
+      }
+    }
+  }
+  const powered = new Set()
+  for (const cam of cameras) {
+    if (reachable.has(endpointId('cam', cam.id))) powered.add(cam.id)
+  }
+  return powered
+}
 
 // Camera quality presets used by the observable-range calculator (horizontal pixel counts)
 const RESOLUTIONS = [
@@ -77,6 +156,7 @@ const CAMERA_CATALOG = [
   {
     id: 'indoor-dome',
     name: 'Indoor Dome 2K',
+    presetId: 'indoor-wide',
     kind: 'dome',
     accent: '#4ade80',
     resolutionLabel: '2K · 3MP',
@@ -88,6 +168,7 @@ const CAMERA_CATALOG = [
   {
     id: 'outdoor-bullet',
     name: 'Outdoor Bullet 4MP',
+    presetId: 'outdoor-bullet',
     kind: 'bullet',
     accent: '#60a5fa',
     resolutionLabel: '4MP 2K',
@@ -99,6 +180,7 @@ const CAMERA_CATALOG = [
   {
     id: 'turret-2k',
     name: '2K Turret Cam',
+    presetId: 'dome',
     kind: 'turret',
     accent: '#f472b6',
     resolutionLabel: '4MP 2K',
@@ -110,6 +192,7 @@ const CAMERA_CATALOG = [
   {
     id: 'ptz-8mp',
     name: 'PTZ 8MP',
+    presetId: 'ptz',
     kind: 'ptz',
     accent: '#fbbf24',
     resolutionLabel: '8MP 4K',
@@ -162,7 +245,7 @@ function getDoorSegmentWorld(door, wall) {
   }
 }
 
-function drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, extraWalls) {
+function drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, extraWalls, skipContaining, ghostWalls, ghostHull) {
   const start = toCanvas(cam.x, cam.y, origin, pan, zoom)
   const hFovRad = (cam.hFov * Math.PI) / 180
   const dist = cam.distance * PIXELS_PER_METER * zoom
@@ -175,6 +258,7 @@ function drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, extraWalls) {
   ctx.moveTo(start.x, start.y)
 
   const rayCount = 72
+  const camOutsideHull = !(ghostHull && ghostHull.length >= 3 && isPointInPolygon(cam.x, cam.y, ghostHull))
   const allWalls = [...walls, ...(extraWalls || [])]
   const wallWindows = new Map()
   const wallDoors = new Map()
@@ -198,6 +282,9 @@ function drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, extraWalls) {
       const windows = wallWindows.get(wall.id) || []
       const doors = wallDoors.get(wall.id) || []
       const closed = wall.closed !== false
+      if (skipContaining && closed && wall.points.length >= 3 && isPointInPolygon(cam.x, cam.y, wall.points)) {
+        continue
+      }
       for (let j = 0; j < wall.points.length; j++) {
         const nextJ = closed ? (j + 1) % wall.points.length : j + 1
         if (nextJ >= wall.points.length) break
@@ -255,6 +342,37 @@ function drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, extraWalls) {
       }
     }
 
+    if (camOutsideHull && ghostWalls && ghostWalls.length) {
+      for (const ghost of ghostWalls) {
+        const closedG = ghost.closed !== false
+        for (let j = 0; j < ghost.points.length; j++) {
+          const nextJ = closedG ? (j + 1) % ghost.points.length : j + 1
+          if (nextJ >= ghost.points.length) break
+          const p1W = ghost.points[j]
+          const p2W = ghost.points[nextJ]
+          const p1 = toCanvas(p1W.x, p1W.y, origin, pan, zoom)
+          const p2 = toCanvas(p2W.x, p2W.y, origin, pan, zoom)
+          const segDx = p2.x - p1.x
+          const segDy = p2.y - p1.y
+          const segLen = Math.hypot(segDx, segDy) || 1
+          const ext = 0.005 * PIXELS_PER_METER * zoom
+          const ep1x = p1.x - (segDx / segLen) * ext
+          const ep1y = p1.y - (segDy / segLen) * ext
+          const ep2x = p2.x + (segDx / segLen) * ext
+          const ep2y = p2.y + (segDy / segLen) * ext
+          const eSegDx = ep2x - ep1x
+          const eSegDy = ep2y - ep1y
+          const denom = dx * eSegDy - dy * eSegDx
+          if (Math.abs(denom) < 1e-8) continue
+          const t = ((ep1x - start.x) * eSegDy - (ep1y - start.y) * eSegDx) / denom
+          const u = ((ep1x - start.x) * dy - (ep1y - start.y) * dx) / denom
+          if (t > 0 && u >= -0.01 && u <= 1.01 && t < nearest) {
+            nearest = t
+          }
+        }
+      }
+    }
+
     for (const obj of objects) {
       // Wall-attached doors are handled as their swung leaf above; they do not
       // have a free-standing x/y rectangle to test here.
@@ -303,6 +421,32 @@ function drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, extraWalls) {
   ctx.strokeStyle = cam.color
   ctx.lineWidth = 1
   ctx.stroke()
+}
+
+function drawGhostFloor(ctx, walls, origin, pan, zoom, color) {
+  if (!walls || walls.length === 0) return
+  ctx.save()
+  ctx.setLineDash([6, 5])
+  ctx.lineCap = 'round'
+  ctx.globalAlpha = 0.45
+  for (const wall of walls) {
+    const closed = wall.closed !== false
+    for (let i = 0; i < wall.points.length; i++) {
+      const p1 = wall.points[i]
+      const nextI = closed ? (i + 1) % wall.points.length : i + 1
+      if (nextI >= wall.points.length) break
+      const p2 = wall.points[nextI]
+      const c1 = toCanvas(p1.x, p1.y, origin, pan, zoom)
+      const c2 = toCanvas(p2.x, p2.y, origin, pan, zoom)
+      ctx.beginPath()
+      ctx.moveTo(c1.x, c1.y)
+      ctx.lineTo(c2.x, c2.y)
+      ctx.strokeStyle = color || '#6366f1'
+      ctx.lineWidth = 2.5 * zoom
+      ctx.stroke()
+    }
+  }
+  ctx.restore()
 }
 
 function drawSegmentLine(ctx, p1, p2, origin, pan, zoom) {
@@ -663,6 +807,8 @@ function drawObject(ctx, obj, origin, pan, zoom, walls) {
   const rot = (obj.rotation * Math.PI) / 180
 
   ctx.save()
+  ctx.translate(cp.x, cp.y)
+  ctx.rotate(rot)
   // some object types (doors) need custom hinge-based drawing; keep cp/rot available
 
   ctx.fillStyle = preset.color + '33'
@@ -700,10 +846,115 @@ function drawObject(ctx, obj, origin, pan, zoom, walls) {
     ctx.strokeRect(-w, -h / 2, w, h)
     ctx.restore()
     // (removed rotating semicircle here; rotation handle is drawn as the fixed big arc when selected)
+  } else if (preset.id === 'stairs-straight') {
+    ctx.strokeStyle = preset.color
+    ctx.lineWidth = 1.5
+    const treads = 6
+    for (let i = 1; i < treads; i++) {
+      const t = i / treads
+      ctx.beginPath()
+      ctx.moveTo(-w / 2 + w * t, -h / 2)
+      ctx.lineTo(-w / 2 + w * t, h / 2)
+      ctx.stroke()
+    }
+    ctx.fillStyle = preset.color
+    ctx.beginPath()
+    ctx.moveTo(0, -h * 0.18)
+    ctx.lineTo(-3.5, h * 0.04)
+    ctx.lineTo(3.5, h * 0.04)
+    ctx.closePath()
+    ctx.fill()
+  } else if (preset.id === 'stairs-curved') {
+    ctx.strokeStyle = preset.color
+    ctx.lineWidth = 1.5
+    const r = Math.min(w, h) * 0.42
+    for (let i = 1; i <= 4; i++) {
+      ctx.beginPath()
+      ctx.arc(-r * 0.15, 0, (i / 4) * r, Math.PI * 0.5, Math.PI * 1.95)
+      ctx.stroke()
+    }
+    ctx.fillStyle = preset.color
+    ctx.beginPath()
+    ctx.arc(-r * 0.15, 0, 2.5, 0, Math.PI * 2)
+    ctx.fill()
   }
 
   // ensure we end in a clean state
   try { ctx.restore() } catch (e) { }
+}
+
+function drawWire(ctx, wire, origin, pan, zoom) {
+  if (!wire.points || wire.points.length < 2) return
+  ctx.save()
+  ctx.strokeStyle = '#f97316'
+  ctx.lineWidth = 3
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  ctx.setLineDash([8, 4])
+  ctx.beginPath()
+  const first = toCanvas(wire.points[0].x, wire.points[0].y, origin, pan, zoom)
+  ctx.moveTo(first.x, first.y)
+  for (let i = 1; i < wire.points.length; i++) {
+    const p = toCanvas(wire.points[i].x, wire.points[i].y, origin, pan, zoom)
+    ctx.lineTo(p.x, p.y)
+  }
+  ctx.stroke()
+  ctx.setLineDash([])
+  for (const idx of [0, wire.points.length - 1]) {
+    const p = toCanvas(wire.points[idx].x, wire.points[idx].y, origin, pan, zoom)
+    ctx.beginPath()
+    ctx.arc(p.x, p.y, 4, 0, Math.PI * 2)
+    ctx.fillStyle = '#f97316'
+    ctx.fill()
+    ctx.strokeStyle = '#fff'
+    ctx.lineWidth = 1.5
+    ctx.stroke()
+  }
+  ctx.restore()
+}
+
+function convexHull(points) {
+  const pts = [...points].sort((a, b) => a.x - b.x || a.y - b.y)
+  if (pts.length <= 1) return pts
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+  const lower = []
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop()
+    lower.push(p)
+  }
+  const upper = []
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i]
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop()
+    upper.push(p)
+  }
+  lower.pop()
+  upper.pop()
+  return lower.concat(upper)
+}
+
+function scalePolygon(poly, cx, cy, factor) {
+  return poly.map((p) => ({ x: cx + (p.x - cx) * factor, y: cy + (p.y - cy) * factor }))
+}
+
+// Isometric exterior view: the ground-floor footprint extruded into walls, a hip roof,
+// and the surrounding lot (lawn, boundary, driveway and trees).
+function drawRoofBackdrop(ctx, pts, floorInfo, origin, pan, zoom) {
+  // The roof floor stays clean like the other floors: no enclosing squares.
+  // Only a small legend explaining the coloured ghost lines of the floors below.
+  ctx.font = '12px system-ui, sans-serif'
+  ctx.textAlign = 'left'
+  ctx.textBaseline = 'top'
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.75)'
+  ctx.fillText('Roof — below floors shown faint; edit the roof here', 14, 14)
+  let ly = 34
+  for (let i = 0; i < floorInfo.length; i++) {
+    ctx.fillStyle = FLOOR_COLORS[i] || '#64748b'
+    ctx.fillRect(14, ly, 14, 8)
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.8)'
+    ctx.fillText(floorInfo[i].name + (floorInfo[i].hasWalls ? '' : ' (empty)'), 34, ly - 1)
+    ly += 18
+  }
 }
 
 function drawRotationArc(ctx, cam, origin, pan, zoom) {
@@ -768,6 +1019,11 @@ function App() {
   const [currentWall, setCurrentWall] = useState(null)
   const [rectStart, setRectStart] = useState(null)
   const [rectEnd, setRectEnd] = useState(null)
+  const [wires, setWires] = useState([])
+  const [currentWire, setCurrentWire] = useState(null)
+  const [wireSnap, setWireSnap] = useState(null)
+  const [activeFloor, setActiveFloor] = useState(0)
+  const floorsRef = useRef({})
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [zoom, setZoom] = useState(1)
   const [origin, setOrigin] = useState({ x: 0, y: 0 })
@@ -786,6 +1042,9 @@ function App() {
   const [windowDrag, setWindowDrag] = useState(null)
   const [lastClick, setLastClick] = useState(null)
   const [showSidebar, setShowSidebar] = useState(true)
+  const [sideTab, setSideTab] = useState('cameras')
+  const [doorHinge, setDoorHinge] = useState('right')
+  const [sideSelection, setSideSelection] = useState(null)
   const [specFov, setSpecFov] = useState(90)
   const [specResolution, setSpecResolution] = useState(RESOLUTIONS[1])
   const [specGoal, setSpecGoal] = useState(DETECTION_LEVELS[0])
@@ -810,6 +1069,39 @@ function App() {
       prev.map((c) => (c.id === selectedCamera.id ? { ...c, hFov: specFov, distance } : c)),
     )
     setSelectedCamera((prev) => (prev ? { ...prev, hFov: specFov, distance } : prev))
+  }
+
+  function placeCatalogCamera(presetId) {
+    const preset = PRESETS.find((p) => p.id === presetId)
+    if (!preset) return
+    setSelectedPreset(preset)
+    setMode('camera')
+    setSideSelection({ type: 'camera', id: presetId })
+  }
+
+  function placeCatalogObject(preset) {
+    if (!preset) return
+    setActiveObjectPreset(preset)
+    setMode('object')
+    setShowObjectPanel(true)
+    setSelectedCamera(null)
+    setSelectedRoom(null)
+    setPlacingObject(null)
+    setWindowDrag(null)
+    setSideSelection({ type: 'object', id: preset.id })
+  }
+
+  function activateTool(tool) {
+    setSideSelection(null)
+    setMode(tool)
+    setSelectedCamera(null)
+    setSelectedRoom(null)
+    setPlacingObject(null)
+    setWindowDrag(null)
+    setShowObjectPanel(false)
+    setCurrentWall(null)
+    setRectStart(null)
+    setRectEnd(null)
   }
 
   const [size, setSize] = useState({ width: 800, height: 600 })
@@ -932,7 +1224,31 @@ function App() {
 
     ctx.fillStyle = '#f8fafc'
     ctx.fillRect(0, 0, w, h)
-    drawGrid(ctx, w, h, pan, zoom)
+    const isRoofFloor = activeFloor === FLOOR_NAMES.length - 1
+    if (isRoofFloor) {
+      // Combined footprint of every floor (including this roof floor) for lot + roof outline
+      const allPts = []
+      const floorInfo = FLOOR_NAMES.map((name, i) => {
+        const f = i === activeFloor ? { walls } : floorsRef.current[i]
+        if (f && f.walls) for (const wall of f.walls) for (const p of wall.points) allPts.push(p)
+        return { name, hasWalls: !!(f && f.walls && f.walls.length) }
+      })
+      drawRoofBackdrop(ctx, allPts, floorInfo, origin, pan, zoom)
+      // Ghost every floor below so you can align the roof layout
+      for (let fi = 0; fi < activeFloor; fi++) {
+        const f = floorsRef.current[fi]
+        if (f && f.walls) drawGhostFloor(ctx, f.walls, origin, pan, zoom, FLOOR_COLORS[fi])
+      }
+    } else {
+      drawGrid(ctx, w, h, pan, zoom)
+      if (activeFloor > 0) {
+        const below = floorsRef.current[activeFloor - 1]
+        const belowWalls = below && below.walls && below.walls.length
+          ? below.walls
+          : (floorsRef.current[0] && floorsRef.current[0].walls ? floorsRef.current[0].walls : [])
+        drawGhostFloor(ctx, belowWalls, origin, pan, zoom)
+      }
+    }
 
     for (const wall of walls) {
       drawWall(ctx, wall, origin, pan, zoom, objects)
@@ -952,9 +1268,42 @@ function App() {
       ctx.stroke()
     }
 
+    for (const w of wires) {
+      drawWire(ctx, w, origin, pan, zoom)
+    }
+    if (currentWire && currentWire.points.length >= 1) {
+      const lastPt = currentWire.points[currentWire.points.length - 1]
+      const hover = currentWire.hoverSnap
+      if (hover) {
+        const a = toCanvas(lastPt.x, lastPt.y, origin, pan, zoom)
+        const b = toCanvas(hover.x, hover.y, origin, pan, zoom)
+        ctx.save()
+        ctx.strokeStyle = '#f97316'
+        ctx.lineWidth = 2
+        ctx.setLineDash([6, 4])
+        ctx.beginPath()
+        ctx.moveTo(a.x, a.y)
+        ctx.lineTo(b.x, b.y)
+        ctx.stroke()
+        ctx.restore()
+      }
+      drawWire(ctx, currentWire, origin, pan, zoom)
+    }
+    const poweredCameraIds = computePoweredCameraIds(cameras, objects, wires)
+    let ghostWalls = []
+    let ghostHull = null
+    if (activeFloor === FLOOR_NAMES.length - 1) {
+      for (let fi = 0; fi < activeFloor; fi++) {
+        const f = floorsRef.current[fi]
+        if (f && f.walls) ghostWalls = ghostWalls.concat(f.walls)
+      }
+      const allPts = []
+      for (const w of ghostWalls) for (const p of w.points) allPts.push(p)
+      ghostHull = convexHull(allPts)
+    }
     for (const cam of cameras) {
       const cp = toCanvas(cam.x, cam.y, origin, pan, zoom)
-      drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, currentWall ? [currentWall] : [])
+      drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, currentWall ? [currentWall] : [], activeFloor === FLOOR_NAMES.length - 1, ghostWalls, ghostHull)
       const rot = (cam.rotation * Math.PI) / 180
       const arrowLen = 12 * zoom
       const dirX = cp.x + arrowLen * Math.cos(rot)
@@ -975,6 +1324,24 @@ function App() {
       ctx.fillStyle = '#000'
       ctx.font = '10px system-ui, sans-serif'
       ctx.fillText(cam.label || 'Cam', cp.x + 9, cp.y + 3)
+      if (poweredCameraIds.has(cam.id)) {
+        ctx.beginPath()
+        ctx.arc(cp.x, cp.y, 12 * zoom, 0, Math.PI * 2)
+        ctx.strokeStyle = '#22c55e'
+        ctx.lineWidth = 2.5
+        ctx.setLineDash([3, 3])
+        ctx.stroke()
+        ctx.setLineDash([])
+        ctx.beginPath()
+        ctx.arc(cp.x + 11 * zoom, cp.y - 11 * zoom, 6 * zoom, 0, Math.PI * 2)
+        ctx.fillStyle = '#22c55e'
+        ctx.fill()
+        ctx.fillStyle = '#fff'
+        ctx.font = 'bold 9px system-ui'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText('\u26A1', cp.x + 11 * zoom, cp.y - 11 * zoom)
+      }
     }
 
     if (placingCamera) {
@@ -1154,7 +1521,18 @@ function App() {
       ctx.fillStyle = '#ef4444'
       ctx.fill()
     }
-  }, [walls, currentWall, cameras, pan, zoom, origin, mode, size, placingCamera, selectedCamera, rectStart, rectEnd, objects, placingObject, selectedRoom, hoveredPoint, activeObjectPreset, selectedObject, windowDrag])
+
+    if (mode === 'wire' && wireSnap && currentWire) {
+      const cp = toCanvas(wireSnap.x, wireSnap.y, origin, pan, zoom)
+      ctx.beginPath()
+      ctx.arc(cp.x, cp.y, 10, 0, Math.PI * 2)
+      ctx.strokeStyle = wireSnap.kind === 'power' ? '#84cc16' : '#22c55e'
+      ctx.lineWidth = 2
+      ctx.setLineDash([3, 3])
+      ctx.stroke()
+      ctx.setLineDash([])
+    }
+  }, [walls, currentWall, cameras, pan, zoom, origin, mode, size, placingCamera, selectedCamera, rectStart, rectEnd, objects, placingObject, selectedRoom, hoveredPoint, activeObjectPreset, selectedObject, windowDrag, wires, wireSnap, currentWire, activeFloor])
 
   function getMouseWorld(e) {
     const canvas = canvasRef.current
@@ -1168,6 +1546,22 @@ function App() {
     const canvas = canvasRef.current
     const rect = canvas.getBoundingClientRect()
     return { x: e.clientX - rect.left, y: e.clientY - rect.top }
+  }
+
+  function snapToBelowWorld(world) {
+    if (activeFloor <= 0) return world
+    let belowWalls = []
+    const below = floorsRef.current[activeFloor - 1]
+    if (below && below.walls && below.walls.length) belowWalls = below.walls
+    else if (floorsRef.current[0] && floorsRef.current[0].walls) belowWalls = floorsRef.current[0].walls
+    if (!belowWalls.length) return world
+    const hit = findNearestWallSegment(world, belowWalls, origin, pan, zoom, 14)
+    if (!hit) return world
+    const wall = belowWalls.find((w) => w.id === hit.wallId)
+    if (!wall) return world
+    const p1 = wall.points[hit.segmentIndex]
+    const p2 = wall.points[(hit.segmentIndex + 1) % wall.points.length]
+    return { x: p1.x + (p2.x - p1.x) * hit.t, y: p1.y + (p2.y - p1.y) * hit.t }
   }
 
   function handleMouseDown(e) {
@@ -1315,7 +1709,7 @@ function App() {
               t1,
               t2,
               rotation: wallAngle,
-              hingeSide: 'right',
+              hingeSide: doorHinge,
             }])
           }
         }
@@ -1331,15 +1725,17 @@ function App() {
     }
 
     if (mode === 'rectangle') {
-      setRectStart({ x: world.x, y: world.y })
-      setRectEnd({ x: world.x, y: world.y })
-      setDrag({ type: 'rect', startX: world.x, startY: world.y })
+      const sw = snapToBelowWorld({ x: world.x, y: world.y })
+      setRectStart({ x: sw.x, y: sw.y })
+      setRectEnd({ x: sw.x, y: sw.y })
+      setDrag({ type: 'rect', startX: sw.x, startY: sw.y })
       return
     }
 
     if (mode === 'wall') {
+      const sw = snapToBelowWorld({ x: world.x, y: world.y })
       setCurrentWall((prev) => {
-        const points = prev ? [...prev.points, { x: world.x, y: world.y }] : [{ x: world.x, y: world.y }]
+        const points = prev ? [...prev.points, { x: sw.x, y: sw.y }] : [{ x: sw.x, y: sw.y }]
         return {
           id: prev?.id ?? nextId++,
           ...prev,
@@ -1347,6 +1743,34 @@ function App() {
           label: prev?.label || `Room ${walls.length + 1}`,
         }
       })
+      return
+    }
+
+    if (mode === 'wire') {
+      const snap = findSnapTarget({ x: world.x, y: world.y, canvasX: c.x, canvasY: c.y }, cameras, objects, origin, pan, zoom)
+      const settle = snap ? { x: snap.x, y: snap.y, snapId: endpointId(snap.kind, snap.id) } : null
+      setCurrentWire((prev) => {
+        if (!prev) {
+          return {
+            id: nextId++,
+            points: [settle || { x: world.x, y: world.y }],
+            snapStartId: settle ? settle.snapId : null,
+            snapEndId: settle ? settle.snapId : null,
+            hoverSnap: null,
+          }
+        }
+        const last = prev.points[prev.points.length - 1]
+        if (settle && prev.snapEndId === settle.snapId && Math.hypot(last.x - world.x, last.y - world.y) < 0.0001) {
+          setTimeout(finishWire, 0)
+          return prev
+        }
+        const newPt = settle || { x: world.x, y: world.y }
+        const points = [...prev.points, newPt]
+        const updated = { ...prev, points, hoverSnap: null }
+        if (settle) updated.snapEndId = settle.snapId
+        return updated
+      })
+      setWireSnap(snap)
       return
     }
 
@@ -1665,6 +2089,13 @@ function App() {
       return
     }
 
+    if (mode === 'wire' && currentWire) {
+      const world = getMouseWorld(e)
+      const cc = getMouseCanvas(e)
+      const snap = findSnapTarget({ x: world.x, y: world.y, canvasX: cc.x, canvasY: cc.y }, cameras, objects, origin, pan, zoom)
+      setWireSnap(snap)
+      setCurrentWire((prev) => prev ? { ...prev, hoverSnap: snap ? { ...snap, id: endpointId(snap.kind, snap.id) } : null } : prev)
+    }
     if (!drag) return
     if (drag.type === 'pan') {
       const dx = e.clientX - drag.startX
@@ -1735,7 +2166,8 @@ function App() {
       }
     } else if (drag.type === 'rect') {
       const world = getMouseWorld(e)
-      setRectEnd({ x: world.x, y: world.y })
+      const sw = snapToBelowWorld({ x: world.x, y: world.y })
+      setRectEnd({ x: sw.x, y: sw.y })
     }
   }
 
@@ -1828,6 +2260,57 @@ function App() {
     setPan((prev) => ({ x: prev.x - dx * 0.4 * zoom, y: prev.y - dy * 0.4 * zoom }))
   }
 
+  function flushActiveFloor() {
+    let fWalls = walls
+    let fWires = wires
+    if (currentWall && currentWall.points.length >= 2) fWalls = [...walls, { ...currentWall, closed: false }]
+    if (currentWire && currentWire.points.length >= 2) fWires = [...wires, { ...currentWire }]
+    floorsRef.current[activeFloor] = { walls: fWalls, cameras, objects, wires: fWires }
+  }
+
+  function switchFloor(i) {
+    if (i === activeFloor) return
+    flushActiveFloor()
+    setActiveFloor(i)
+    const saved = floorsRef.current[i]
+    setWalls(saved ? saved.walls : [])
+    setCameras(saved ? saved.cameras : [])
+    setObjects(saved ? saved.objects : [])
+    setWires(saved ? saved.wires : [])
+    setCurrentWall(null)
+    setCurrentWire(null)
+    setWireSnap(null)
+    setSelectedCamera(null)
+    setSelectedObject(null)
+    setSelectedRoom(null)
+    setRectStart(null)
+    setRectEnd(null)
+    setPlacingCamera(null)
+    setPlacingObject(null)
+    setWindowDrag(null)
+    setHoveredPoint(null)
+  }
+
+  function rotateSelectedObject() {
+    if (!selectedObject) return
+    const next = ((selectedObject.rotation || 0) + 90) % 360
+    setObjects((prev) => prev.map((o) => (o.id === selectedObject.id ? { ...o, rotation: next } : o)))
+    setSelectedObject((prev) => (prev ? { ...prev, rotation: next } : prev))
+  }
+
+  function finishWire() {
+    if (currentWire && currentWire.points.length >= 2) {
+      setWires((prev) => [...prev, { ...currentWire }])
+    }
+    setCurrentWire(null)
+    setWireSnap(null)
+  }
+
+  function cancelWire() {
+    setCurrentWire(null)
+    setWireSnap(null)
+  }
+
   function finishWall() {
     if (currentWall && currentWall.points.length >= 2) {
       setWalls((prev) => [...prev, { ...currentWall, closed: false }])
@@ -1907,23 +2390,16 @@ function App() {
     <div className="app">
       <div className="toolbar">
         <div className="tools">
-          <button className={mode === 'wall' ? 'active' : ''} onClick={() => { setMode('wall'); setSelectedCamera(null); setSelectedRoom(null); setPlacingObject(null); setWindowDrag(null); setShowObjectPanel(false) }}>
-            Wall
-          </button>
-          <button className={mode === 'rectangle' ? 'active' : ''} onClick={() => { setMode('rectangle'); setSelectedCamera(null); setSelectedRoom(null); setCurrentWall(null); setPlacingObject(null); setWindowDrag(null); setShowObjectPanel(false) }}>
-            Rectangle
-          </button>
-          <button className={mode === 'camera' ? 'active' : ''} onClick={() => { setMode('camera'); setSelectedCamera(null); setSelectedRoom(null); setPlacingObject(null); setWindowDrag(null); setShowObjectPanel(false) }}>
-            Camera
-          </button>
-          <button className={mode === 'object' ? 'active' : ''} onClick={() => { setMode('object'); setSelectedCamera(null); setSelectedRoom(null); setPlacingObject(null); setWindowDrag(null); setShowObjectPanel((prev) => !prev) }}>
-            Objects
-          </button>
-          <button className={mode === 'select' ? 'active' : ''} onClick={() => { setMode('select'); setCurrentWall(null); setRectStart(null); setRectEnd(null); setPlacingObject(null); setWindowDrag(null); setShowObjectPanel(false) }}>
+          <button className={mode === 'select' ? 'active' : ''} onClick={() => { setSideSelection(null); setMode('select'); setCurrentWall(null); setRectStart(null); setRectEnd(null); setPlacingObject(null); setWindowDrag(null); setShowObjectPanel(false) }}>
             Select
           </button>
         </div>
         <div className="controls">
+          <div className="floor-switch">
+            {FLOOR_NAMES.map((name, i) => (
+              <button key={name} className={activeFloor === i ? 'active' : ''} onClick={() => switchFloor(i)} title="Switch floor layout">{name}</button>
+            ))}
+          </div>
           {mode === 'wall' && (
             <>
               <span className="hint">Click to add wall points</span>
@@ -1935,6 +2411,13 @@ function App() {
             <>
               <span className="hint">Click and drag to draw a room</span>
               <button onClick={() => { setRectStart(null); setRectEnd(null) }}>Cancel</button>
+            </>
+          )}
+          {mode === 'wire' && (
+            <>
+              <span className="hint">Click to route wire. Click a camera or outlet to snap.</span>
+              <button onClick={finishWire} disabled={!currentWire || currentWire.points.length < 2}>Finish Wire</button>
+              <button onClick={cancelWire}>Cancel</button>
             </>
           )}
           {mode === 'camera' && (
@@ -1970,6 +2453,7 @@ function App() {
           )}
           {mode === 'select' && selectedObject && (
             <>
+              <button onClick={rotateSelectedObject}>Rotate 90°</button>
               <button onClick={deleteSelected}>Delete Object</button>
             </>
           )}
@@ -1983,7 +2467,7 @@ function App() {
           <button onClick={resetView}>Reset View</button>
         </div>
       </div>
-      <div className="workspace">
+<div className="workspace">
         <div className="canvas-wrap" ref={containerRef}>
           <canvas
             ref={canvasRef}
@@ -1998,23 +2482,58 @@ function App() {
             <button onClick={zoomOut}>-</button>
           </div>
         </div>
-        <button
-          className={`side-tab${showSidebar ? ' open' : ''}`}
-          onClick={() => setShowSidebar((v) => !v)}
-          title="Camera specs and recommendations"
-        >
-          <svg className="tab-icon" viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true">
-            <path d="M2 7a2 2 0 0 1 2-2h1.2l1-2h7.6l1 2H16a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7Z" fill="currentColor" opacity="0.9"/>
-            <circle cx="10" cy="10.5" r="3.2" fill="#0f172a"/>
-            <circle cx="10" cy="10.5" r="1.5" fill="currentColor"/>
-          </svg>
-          <span>Cameras</span>
-        </button>
+        <div className="side-tabs">
+          <button
+            className={`side-tab${showSidebar && sideTab === 'cameras' ? ' open' : ''}`}
+            onClick={() => {
+              if (showSidebar && sideTab === 'cameras') setShowSidebar(false)
+              else { setSideTab('cameras'); setShowSidebar(true) }
+            }}
+            title="Camera specs and recommendations"
+          >
+            <svg className="tab-icon" viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true">
+              <path d="M2 7a2 2 0 0 1 2-2h1.2l1-2h7.6l1 2H16a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7Z" fill="currentColor" opacity="0.9"/>
+              <circle cx="10" cy="10.5" r="3.2" fill="#0f172a"/>
+              <circle cx="10" cy="10.5" r="1.5" fill="currentColor"/>
+            </svg>
+            <span>Cameras</span>
+          </button>
+          <button
+            className={`side-tab${showSidebar && sideTab === 'objects' ? ' open' : ''}`}
+            onClick={() => {
+              if (showSidebar && sideTab === 'objects') setShowSidebar(false)
+              else { setSideTab('objects'); setShowSidebar(true) }
+            }}
+            title="Objects"
+          >
+            <svg className="tab-icon" viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true">
+              <rect x="3" y="3" width="14" height="14" rx="2" fill="currentColor" opacity="0.9"/>
+              <rect x="7" y="7" width="6" height="6" fill="#0f172a"/>
+            </svg>
+            <span>Objects</span>
+          </button>
+          <button
+            className={`side-tab${showSidebar && sideTab === 'tools' ? ' open' : ''}`}
+            onClick={() => {
+              if (showSidebar && sideTab === 'tools') setShowSidebar(false)
+              else { setSideTab('tools'); setShowSidebar(true) }
+            }}
+            title="Drawing tools"
+          >
+            <svg className="tab-icon" viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true">
+              <path d="M3 17l1-4 10-10 3 3-10 10-4 1Z" fill="currentColor" opacity="0.9"/>
+              <path d="M13 4l3 3" stroke="#0f172a" strokeWidth="1.4"/>
+            </svg>
+            <span>Tools</span>
+          </button>
+        </div>
         {showSidebar && (
           <aside className="sidebar">
-            <div className="sidebar-header">
-              <h2>Camera planner</h2>
-            </div>
+            {sideTab === 'cameras' ? (
+              <>
+                <div className="sidebar-header">
+                  <h2>Camera planner</h2>
+                </div>
             <section className="side-section">
               <h3>Estimate observable range</h3>
               <div className="spec-row">
@@ -2054,10 +2573,21 @@ function App() {
             </section>
             <section className="side-section">
               <h3>Recommended cameras</h3>
-              <p className="spec-hint">Paste your affiliate links into each camera below to turn on the Buy button.</p>
+              {mode === 'camera' && (
+                <p className="catalog-hint">Click on the plan to place <strong>{selectedPreset.label}</strong></p>
+              )}
+              <p className="spec-hint">Click any card to load it into the camera tool (then click the plan to place), or paste affiliate links into <code>CAMERA_CATALOG.referralUrl</code> to enable Buy buttons.</p>
               <div className="cam-list">
                 {CAMERA_CATALOG.map((c) => (
-                  <div className="cam-card" key={c.id}>
+                  <div
+                    className={`cam-card${sideSelection && sideSelection.type === 'camera' && sideSelection.id === c.presetId ? ' active' : ''}`}
+                    key={c.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => placeCatalogCamera(c.presetId)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); placeCatalogCamera(c.presetId) } }}
+                    title={`Switch the camera tool to ${c.name}`}
+                  >
                     <img className="cam-img" src={cameraSvg(c.accent, c.kind)} alt={c.name} />
                     <div className="cam-info">
                       <div className="cam-name">{c.name}</div>
@@ -2068,15 +2598,133 @@ function App() {
                         <span>{c.rating}</span>
                       </div>
                       {c.referralUrl ? (
-                        <a className="cam-buy" href={c.referralUrl} target="_blank" rel="noreferrer">Buy</a>
+                        <a className="cam-buy" href={c.referralUrl} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>Buy</a>
                       ) : (
-                        <span className="cam-buy pending" title="Add your affiliate link to CAMERA_CATALOG in src/App.jsx">Buy — link soon</span>
+                        <span className="cam-buy pending" onClick={(e) => e.stopPropagation()} title="Add your affiliate link to CAMERA_CATALOG in src/App.jsx">Buy — link soon</span>
                       )}
                     </div>
                   </div>
                 ))}
               </div>
             </section>
+              </>
+            ) : sideTab === 'objects' ? (
+              <>
+                <div className="sidebar-header">
+                  <h2>Objects</h2>
+                </div>
+                <section className="side-section">
+                  <h3>Place objects</h3>
+                  <p className="spec-hint">Click an object to load it into the Objects tool, then click the plan to place it.</p>
+                  <div className="cam-list">
+                    {OBJECT_PRESETS.map((p) => (
+                      <div
+                        className={`cam-card${sideSelection && sideSelection.type === 'object' && sideSelection.id === p.id ? ' active' : ''}`}
+                        key={p.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => placeCatalogObject(p)}
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); placeCatalogObject(p) } }}
+                        title={`Load ${p.label} into the Objects tool`}
+                      >
+                        <span className="obj-icon" style={{ backgroundColor: p.color }}></span>
+                        <div className="cam-info">
+                          <div className="cam-name">{p.label}</div>
+                          <div className="cam-tags">
+                            <span>{p.width} × {p.height} m</span>
+                            <span>{p.blocksVision ? 'Blocks vision' : 'Open'}</span>
+                            {p.isPowerSource ? <span>Power</span> : null}
+                          </div>
+                          {p.id === 'door' && (
+                            <div className="door-hinge">
+                              <button className={doorHinge === 'right' ? 'active' : ''} onClick={(e) => { e.stopPropagation(); setDoorHinge('right') }}>Right hinge</button>
+                              <button className={doorHinge === 'left' ? 'active' : ''} onClick={(e) => { e.stopPropagation(); setDoorHinge('left') }}>Left hinge</button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              </>
+            ) : (
+              <>
+                <div className="sidebar-header">
+                  <h2>Tools</h2>
+                </div>
+                <section className="side-section">
+                  <h3>Drawing tools</h3>
+                  <p className="spec-hint">Pick a tool, then click the plan to use it.</p>
+                  <div className="cam-list">
+                    <div
+                      className={`cam-card${mode === 'wall' ? ' active' : ''}`}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => activateTool('wall')}
+                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activateTool('wall') } }}
+                      title="Draw walls point by point"
+                    >
+                      <span className="tool-icon">
+                        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <path d="M4 20V7l4-2 4 2v13" />
+                          <path d="M12 20V8l4-2 4 3v11" />
+                          <path d="M4 20h16" />
+                        </svg>
+                      </span>
+                      <div className="cam-info">
+                        <div className="cam-name">Wall</div>
+                        <div className="cam-tags">
+                          <span>Click points</span>
+                          <span>Finish Wall</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div
+                      className={`cam-card${mode === 'rectangle' ? ' active' : ''}`}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => activateTool('rectangle')}
+                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activateTool('rectangle') } }}
+                      title="Click and drag to draw a room"
+                    >
+                      <span className="tool-icon">
+                        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <rect x="4" y="6" width="16" height="12" rx="1" />
+                        </svg>
+                      </span>
+                      <div className="cam-info">
+                        <div className="cam-name">Rectangle</div>
+                        <div className="cam-tags">
+                          <span>Rooms</span>
+                          <span>Drag</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div
+                      className={`cam-card${mode === 'wire' ? ' active' : ''}`}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => activateTool('wire')}
+                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activateTool('wire') } }}
+                      title="Route power wires between cameras and outlets"
+                    >
+                      <span className="tool-icon">
+                        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <path d="M4 4l4 6 4-4 4 8 4-3" />
+                        </svg>
+                      </span>
+                      <div className="cam-info">
+                        <div className="cam-name">Wire</div>
+                        <div className="cam-tags">
+                          <span>Power</span>
+                          <span>Snaps</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              </>
+            )}
           </aside>
         )}
       </div>
