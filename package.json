@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "email:test": "node scripts/test-email.mjs",
     "stripe:setup": "node scripts/stripe-setup.mjs",
-    "billing:test": "node scripts/test-billing.mjs"
+    "billing:test": "node scripts/test-billing.mjs",
+    "checkout:test": "node scripts/test-checkout-client.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",

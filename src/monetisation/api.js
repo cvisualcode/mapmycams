@@ -894,7 +894,17 @@ export async function startCheckout(itemKey, kind = 'plan') {
   // unlocking something the server will never know about.
   if (!serverToken()) {
     if (await apiAvailable()) {
-      throw new Error('Buying needs a verified account. Sign out and create one with your email address — we email a code to confirm it — then the plan can be paid for and will follow you to any device.')
+      // The server can charge a card, but only for an account it knows about, and
+      // this browser's account predates that. Rather than a dead end, hand the
+      // caller something it can act on: the account gate creates and verifies the
+      // account, then resumes this exact purchase. `needsAccount` is the flag the
+      // UI switches on, so the message can change without breaking the flow.
+      const err = new Error('Confirm your email address to pay — the 6-digit code proves the account is yours, and the plan then follows you to any device.')
+      err.needsAccount = true
+      err.email = sessionUser()?.email || ''
+      err.item = itemKey
+      err.kind = kind
+      throw err
     }
     return grantLocally(itemKey, kind)
   }

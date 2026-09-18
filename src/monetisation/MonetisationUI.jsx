@@ -118,7 +118,7 @@ const PASSWORD_RULES = [
 ]
 
 /** Live checklist shown while choosing a password, matching api.passwordProblem(). */
-function PasswordChecklist({ password }) {
+export function PasswordChecklist({ password }) {
   return (
     <ul className="auth-rules">
       {PASSWORD_RULES.map((r) => (
@@ -242,7 +242,9 @@ function useCheckout() {
     setBusy(item)
     try {
       const res = await ent.startCheckout(item, kind)
-      if (res?.redirecting) return // the browser is on its way to Stripe
+      // Either the browser is on its way to Stripe, or the account gate has taken
+      // over with this purchase held in the context — nothing to report here.
+      if (res?.redirecting || res?.awaitingAccount) return
       setNotice(res?.demo
         ? { kind: 'demo', text: 'Demo mode: nothing on this host can take a payment, so this was unlocked in this browser only — it will not follow you to another device.' }
         : { kind: 'error', text: 'Stripe did not return a checkout page — please try again.' })
@@ -263,6 +265,202 @@ function CheckoutNotice({ notice, onDismiss }) {
     <div className={`checkout-notice ${notice.kind}`}>
       <span>{notice.text}</span>
       <button className="checkout-notice-close" onClick={onDismiss}>✕</button>
+    </div>
+  )
+}
+
+// ─── Account gate ────────────────────────────────────────────────────────────
+// A plan is charged to an account, and only an account the server knows about can
+// be charged. One created in this browser before accounts moved server-side is not
+// one of those, so clicking a plan on it did nothing visible at all. This gate
+// takes a password, verifies the address with an emailed code, and then opens
+// Stripe's own payment page for the exact item that was clicked.
+
+export function CheckoutGate() {
+  const ent = useEntitlements()
+  const gate = ent.checkoutGate
+  const [step, setStep] = useState('account') // account | code
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [code, setCode] = useState('')
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [cooldown, setCooldown] = useState(0)
+
+  // Reset when a purchase opens the gate, starting from the address this browser
+  // already uses so the form is one field shorter for the common case.
+  useEffect(() => {
+    if (!gate) return
+    setStep('account'); setEmail(gate.email || ent.user?.email || '')
+    setPassword(''); setCode(''); setError(''); setNotice(''); setCooldown(0)
+  }, [gate, ent.user?.email])
+
+  // Tick the resend countdown so the button mirrors the server-side cooldown.
+  useEffect(() => {
+    if (cooldown <= 0) return undefined
+    const timer = setTimeout(() => setCooldown((s) => s - 1), 1000)
+    return () => clearTimeout(timer)
+  }, [cooldown])
+
+  if (!gate) return null
+
+  /** The account is real now: send the customer to Stripe for what they clicked. */
+  async function pay() {
+    try {
+      const started = await ent.resumeCheckout()
+      if (started?.awaitingAccount) {
+        setError('That account still cannot be charged for. Sign out and back in from the dashboard, then try again.')
+      }
+    } catch (err) {
+      setError(err.message || 'Could not open the payment page — try again from the dashboard.')
+    }
+  }
+
+  /** Create the account — or sign in, when this address already has one. */
+  async function submitAccount(e) {
+    e.preventDefault()
+    setError(''); setNotice(''); setBusy(true)
+    try {
+      const res = await ent.signup(email, password)
+      // Unverified by definition: no session exists until the code is accepted.
+      if (res?.pendingVerification) { setStep('code'); return }
+      await pay()
+    } catch (signupErr) {
+      // Most likely the address already has a server account, so the same form
+      // doubles as a sign-in. A wrong password fails both ways and is reported.
+      try {
+        const u = await ent.login(email, password)
+        if (u?.pendingVerification) { setStep('code'); return }
+        await pay()
+      } catch (loginErr) {
+        setError(loginErr.message || signupErr.message || 'Could not continue')
+      }
+    } finally { setBusy(false) }
+  }
+
+  /** Enter the emailed code. A session is only issued once it is accepted. */
+  async function submitCode(e) {
+    e.preventDefault()
+    setError(''); setNotice(''); setBusy(true)
+    try {
+      await ent.verifyEmail(code)
+      await pay()
+    } catch (err) {
+      setError(err.message || 'That code is not correct')
+    } finally { setBusy(false) }
+  }
+
+  async function resend() {
+    setError(''); setNotice(''); setBusy(true)
+    try {
+      const res = await ent.resendCode()
+      setCooldown(60)
+      setNotice(res?.devCode
+        ? 'A new code was generated below.'
+        : `A new code is on its way to ${ent.pendingEmail || email}.`)
+    } catch (err) {
+      setError(err.message || 'Could not send another code')
+    } finally { setBusy(false) }
+  }
+
+  function cancel() {
+    // Abandoning the gate abandons the half-registered account with it.
+    if (ent.pendingEmail) ent.cancelVerification()
+    ent.closeCheckoutGate()
+  }
+
+  const itemName = [...PLANS, ...ADDONS].find((i) => i.key === gate.item)?.name || gate.item
+
+  return (
+    <div className="modal-backdrop" onClick={cancel}>
+      <div className="modal checkout-gate" onClick={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={cancel}>✕</button>
+        <div className="upgrade-padlock"><Padlock /></div>
+        <h2>{step === 'account' ? 'Confirm your account to pay' : 'Enter your code'}</h2>
+
+        {step === 'account' ? (
+          <>
+            <p className="upgrade-reason">
+              <strong>{itemName}</strong> is charged to your account, so it needs an email we have confirmed and a
+              password for it. The code we email proves the address is yours, and the plan then travels with you to
+              any device. Stripe’s payment page opens on its own once the code is in.
+            </p>
+            <form onSubmit={submitAccount}>
+              <input
+                className="auth-input"
+                type="email"
+                placeholder="Email address"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                autoComplete="email"
+                required
+                autoFocus
+              />
+              <div className="auth-pass">
+                <input
+                  className="auth-input"
+                  placeholder="Choose a password"
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="new-password"
+                  required
+                />
+                <button type="button" className="auth-eye" onClick={() => setShowPassword((v) => !v)} title={showPassword ? 'Hide password' : 'Show password'}>
+                  {showPassword ? '🙈' : '👁'}
+                </button>
+              </div>
+              <PasswordChecklist password={password} />
+              {error && <div className="auth-error">{error}</div>}
+              <button className="auth-btn" disabled={busy || !email || !password}>
+                {busy ? 'Please wait…' : 'Email me a code'}
+              </button>
+            </form>
+            <p className="auth-legal">
+              Already set a password for this address? The same form signs you in. Nothing is charged until you pay on
+              Stripe’s page.
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="upgrade-reason">
+              We sent a 6-digit code to <strong>{ent.pendingEmail || email}</strong>. Enter it to confirm the account —
+              the payment page for <strong>{itemName}</strong> opens straight after.
+            </p>
+            {ent.devCode && (
+              <div className="auth-warn">
+                ⚠ We couldn’t email the code{ent.deliveryError ? ` (${ent.deliveryError})` : ''}, so here it is instead.
+                <strong className="auth-code-inline">{ent.devCode}</strong>
+              </div>
+            )}
+            <form onSubmit={submitCode}>
+              <input
+                className="auth-input auth-code"
+                placeholder="000000"
+                value={code}
+                onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                aria-label="6-digit verification code"
+                autoFocus
+              />
+              {error && <div className="auth-error">{error}</div>}
+              {notice && <div className="auth-notice">{notice}</div>}
+              <button className="auth-btn" disabled={busy || code.length !== 6}>
+                {busy ? 'Verifying…' : 'Verify and pay'}
+              </button>
+            </form>
+            <button className="auth-admin" onClick={resend} disabled={busy || cooldown > 0}>
+              {cooldown > 0 ? `Resend code in ${cooldown}s` : 'Resend the code'}
+            </button>
+            <p className="auth-switch">
+              <button onClick={() => { setStep('account'); setError(''); setNotice('') }}>Use a different email</button>
+            </p>
+          </>
+        )}
+      </div>
     </div>
   )
 }
@@ -436,13 +634,22 @@ export function PricingPage({ onBack }) {
               <div className="price-big">{formatPrice(p.price)}<span>/{p.period}</span></div>
               <p className="spec-hint">{p.blurb}</p>
               <ul>{p.features.map((f) => <li key={f}>{f}</li>)}</ul>
-              <button
-                className="btn-primary"
-                disabled={isCurrent || busy === p.key}
-                onClick={() => buy(p.key, 'plan')}
-              >
-                {busy === p.key ? 'Opening Stripe…' : isCurrent ? 'Your current plan' : `Choose ${p.name}`}
-              </button>
+              {p.key === 'free' && !isCurrent ? (
+                // Free is not a purchase, so there is nothing to charge and nothing
+                // for the button to do — say how to get here instead.
+                <>
+                  <button className="btn-primary" disabled>Free — no charge</button>
+                  <p className="spec-hint">Cancel a paid plan in the billing portal to move back here.</p>
+                </>
+              ) : (
+                <button
+                  className="btn-primary"
+                  disabled={isCurrent || busy === p.key}
+                  onClick={() => buy(p.key, 'plan')}
+                >
+                  {busy === p.key ? 'Opening Stripe…' : isCurrent ? 'Your current plan' : `Choose ${p.name}`}
+                </button>
+              )}
               {isCurrent && p.key !== 'free' && (
                 <p className="spec-hint">Billed by Stripe. Change the card or cancel from the dashboard.</p>
               )}

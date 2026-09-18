@@ -5,7 +5,7 @@
 
 import { useState } from 'react'
 import { EntitlementsProvider, useEntitlements } from './monetisation/EntitlementsContext'
-import { LoginScreen, VerifyEmailScreen, Dashboard, PricingPage, AdminPanel, UpgradeModal } from './monetisation/MonetisationUI'
+import { LoginScreen, VerifyEmailScreen, Dashboard, PricingPage, AdminPanel, UpgradeModal, CheckoutGate } from './monetisation/MonetisationUI'
 import { buildFloorplanSnapshot, applyFloorplanSnapshot } from './monetisation/snapshotBridge'
 import EditorApp from './App.jsx'
 
@@ -54,8 +54,18 @@ function MonetisedApp() {
     setView('dashboard')
   }
 
-  if (view === 'editor') return <EditorApp onExit={exitEditor} showUpgrade={(t, r) => ent.promptUpgrade(t, r, 'premium_monthly')} />
-  if (view === 'pricing') return <PricingPage onBack={() => setView('dashboard')} />
+  // Both prompts have to be reachable from every view that can start a purchase:
+  // the editor's premium tools open the upgrade modal, and every Buy button can
+  // land on the account gate — including the one inside the upgrade modal itself.
+  const overlays = (
+    <>
+      <UpgradeModal />
+      <CheckoutGate />
+    </>
+  )
+
+  if (view === 'editor') return <><EditorApp onExit={exitEditor} showUpgrade={(t, r) => ent.promptUpgrade(t, r, 'premium_monthly')} />{overlays}</>
+  if (view === 'pricing') return <><PricingPage onBack={() => setView('dashboard')} />{overlays}</>
   if (view === 'admin') return <AdminPanel onBack={() => setView('dashboard')} />
   return (
     <>
@@ -66,7 +76,7 @@ function MonetisedApp() {
         onPricing={() => setView('pricing')}
         onAdmin={() => setView('admin')}
       />
-      <UpgradeModal />
+      {overlays}
     </>
   )
 }

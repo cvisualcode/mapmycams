@@ -285,6 +285,18 @@ Two things that are deliberately *not* possible:
 Billing history comes from `POST /billing/invoices`, which asks Stripe for the
 customer's invoices — so the dashboard and the portal show the same record.
 
+### A purchase needs an account the server knows
+
+A Stripe session is created against an account record, so a plan can only be sold to
+one that exists server-side. An account that lives only in this browser's local store
+cannot be charged for — and on such an account, clicking a plan used to do nothing
+visible at all. So `startCheckout()` raises its error with `needsAccount: true`, and
+`CheckoutGate` — rendered wherever a purchase can start, the editor's upgrade prompt
+included — collects a password, verifies the address with an emailed code, and then
+resumes the exact item that was clicked. `EntitlementsContext` holds that pending
+purchase (`checkoutGate`) so it survives the sign-up step, and only clears it once a
+redirect has genuinely started, which is what keeps a failure on screen to explain.
+
 ### Verifying billing with no Stripe account
 
 ```bash
@@ -295,6 +307,15 @@ That drives the real handler with Stripe stubbed out: the demo grant, the paid
 redirect (including the metadata a subscription needs), the confirm path — another
 account's session refused, an unpaid session granting nothing — invoice mapping,
 the cancel guard, and the webhook signature both valid and forged.
+
+```bash
+bun run checkout:test
+```
+
+That covers the browser half the same way, with `fetch` stubbed: a browser-only
+account produces the flagged error rather than a silent local grant, and with a
+server session the click navigates to the URL Stripe returned — token, item and kind
+included — while a refusal from the server surfaces as an error.
 
 ### Environment variables
 

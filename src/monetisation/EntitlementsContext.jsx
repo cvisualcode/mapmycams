@@ -20,6 +20,10 @@ export function EntitlementsProvider({ children }) {
   const [deliveryError, setDeliveryError] = useState(null)
   // What to tell the user about the trip to Stripe: null | 'success' | 'pending' | 'cancelled' | 'error'
   const [checkoutNotice, setCheckoutNotice] = useState(null)
+  // A purchase that needs a server account first: { item, kind, email } while the
+  // account gate is open, else null. Held here rather than in a button's local
+  // state so it survives the sign-up screen that has to run before the payment.
+  const [checkoutGate, setCheckoutGate] = useState(null)
 
   // Restore any existing session on load.
   useEffect(() => {
@@ -143,12 +147,42 @@ export function EntitlementsProvider({ children }) {
     },
     async logout() { await api.logout(); setUser(null); setFloorplans([]) },
     async startCheckout(item, kind) {
-      const res = await api.startCheckout(item, kind)
-      // Paid mode sends the browser to Stripe, so the entitlement arrives on the
-      // way back (see the return handler above) — not from this call. A demo grant
-      // comes back with the updated account, and a failure throws for the caller
-      // to show, rather than looking like a button that does nothing.
+      try {
+        const res = await api.startCheckout(item, kind)
+        // Paid mode sends the browser to Stripe, so the entitlement arrives on the
+        // way back (see the return handler above) — not from this call. A demo grant
+        // comes back with the updated account, and a failure throws for the caller
+        // to show, rather than looking like a button that does nothing.
+        if (res?.demo) setUser(res.user || await api.getMe())
+        return res
+      } catch (err) {
+        // This browser's account is not one the server can charge a card for.
+        // Opening the gate is the difference between a purchase and a message
+        // telling the customer to go and sort their account out elsewhere.
+        if (err?.needsAccount) {
+          setCheckoutGate({ item, kind, email: err.email || '' })
+          return { awaitingAccount: true }
+        }
+        throw err
+      }
+    },
+    /** Set while a purchase is waiting on a verified account; else null. */
+    checkoutGate,
+    closeCheckoutGate: () => setCheckoutGate(null),
+    /**
+     * Finish the purchase that opened the gate, once the address is verified.
+     * The gate is only closed when a purchase actually started, so a failure
+     * leaves the customer on a screen that can explain what went wrong.
+     */
+    async resumeCheckout() {
+      if (!checkoutGate) return null
+      const res = await api.startCheckout(checkoutGate.item, checkoutGate.kind)
+        .catch((err) => {
+          if (err?.needsAccount) return { awaitingAccount: true }
+          throw err
+        })
       if (res?.demo) setUser(res.user || await api.getMe())
+      if (!res?.awaitingAccount) setCheckoutGate(null)
       return res
     },
     checkoutNotice,
