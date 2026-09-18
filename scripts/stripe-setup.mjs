@@ -11,6 +11,11 @@
 // webhook is matched by URL, so running it again after a change only creates what
 // is actually missing. Secret values are never printed — only where they went.
 
+import { spawnSync } from 'node:child_process'
+import { writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 const STRIPE_API = 'https://api.stripe.com/v1'
 const WORKER = 'mapmycams'
 const APP_URL = (process.env.APP_URL || 'https://mapmycams.dev').replace(/\/+$/, '')
@@ -28,6 +33,12 @@ const CATALOGUE = [
 
 const EVENTS = ['checkout.session.completed', 'customer.subscription.deleted', 'customer.subscription.paused']
 
+// Stripe classifies what it is selling, which is what decides the tax applied.
+// Every price here is a plan or an add-on in the web app, so: SaaS, personal use.
+// This is not optional on a new account — Managed Payments is on by default there,
+// and without a tax code on each product Checkout is refused outright.
+const TAX_CODE = 'txcd_10103000'
+
 const key = process.env.STRIPE_SECRET_KEY
 if (!key) {
   console.error('✗ STRIPE_SECRET_KEY is not set.')
@@ -41,13 +52,27 @@ if (mode === 'unknown') {
   console.warn('! That key does not look like a Stripe secret key (sk_test_… / sk_live_…) — continuing anyway.')
 }
 
+/**
+ * Stripe encodes arrays as repeated indexed params (`enabled_events[0]=…`), which
+ * URLSearchParams will not do on its own: handed an array it stringifies it into a
+ * single comma-joined value, and Stripe then rejects the whole request.
+ */
+function encode(params) {
+  const search = new URLSearchParams()
+  for (const [name, value] of Object.entries(params || {})) {
+    if (Array.isArray(value)) value.forEach((item, i) => search.append(`${name}[${i}]`, String(item)))
+    else if (value !== undefined && value !== null) search.append(name, String(value))
+  }
+  return search
+}
+
 /** One Stripe call. `get` builds a query string, otherwise the body is form-encoded. */
 async function stripe(path, params, method = 'POST', { allow404 = false } = {}) {
-  const query = method === 'GET' && params ? `?${new URLSearchParams(params)}` : ''
+  const query = method === 'GET' && params ? `?${encode(params)}` : ''
   const res = await fetch(`${STRIPE_API}/${path}${query}`, {
     method,
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: method === 'GET' ? undefined : new URLSearchParams(params || {}).toString(),
+    body: method === 'GET' ? undefined : encode(params).toString(),
   })
   if (!res.ok) {
     const body = await res.text()
@@ -64,10 +89,16 @@ const money = (amount, currency = 'gbp') =>
 async function ensureProduct(def) {
   const { data } = await stripe('products', { active: 'true', limit: '100' }, 'GET')
   const existing = data.find((p) => p.metadata?.mmc_item === def.item)
-  if (existing) return existing
+  if (existing) {
+    // Repair a product made before its tax code was set (or set wrongly), which
+    // would otherwise let the whole catalogue vanish from Checkout.
+    if (existing.tax_code !== TAX_CODE) return stripe(`products/${existing.id}`, { tax_code: TAX_CODE })
+    return existing
+  }
   return stripe('products', {
     name: def.name,
     description: def.interval ? `MapMyCams Premium — billed per ${def.interval}` : 'One-time MapMyCams add-on',
+    tax_code: TAX_CODE,
     'metadata[mmc_item]': def.item,
   })
 }
@@ -99,44 +130,78 @@ async function ensurePrice(def, product) {
   return stripe('prices', params)
 }
 
-/** The webhook endpoint the API verifies signatures against. */
+/**
+ * The webhook endpoint the API verifies signatures against.
+ *
+ * Stripe hands back the signing secret exactly once, on create, and there is no
+ * way to read or rotate it afterwards. So an endpoint that is already there is
+ * replaced rather than reused: that is the only way to end up with a secret the
+ * Worker can actually be given. Events for the few seconds in between are retried
+ * by Stripe, so nothing is lost.
+ */
 async function ensureWebhook() {
   const url = `${APP_URL}/webhooks/stripe`
   const { data } = await stripe('webhook_endpoints', { limit: '100' }, 'GET')
   const existing = data.find((w) => w.url === url)
-  if (existing) {
-    const missing = EVENTS.filter((e) => !(existing.enabled_events || []).includes(e) && !(existing.enabled_events || []).includes('*'))
-    if (!missing.length) return { endpoint: existing, secret: null, created: false }
-    const updated = await stripe(`webhook_endpoints/${existing.id}`, {
-      'enabled_events[]': EVENTS,
-    })
-    return { endpoint: updated, secret: null, created: false, updated: true }
-  }
+  // Create the replacement first, then drop the old one: an event landing in the
+  // gap still reaches the endpoint that is definitely accepting deliveries.
   const created = await stripe('webhook_endpoints', {
     url,
     description: 'MapMyCams billing (Worker)',
-    'enabled_events[]': EVENTS,
+    enabled_events: EVENTS,
   })
-  // The signing secret is returned exactly once, by this call.
-  return { endpoint: created, secret: created.secret, created: true }
+  if (existing) await stripe(`webhook_endpoints/${existing.id}`, null, 'DELETE')
+  return { endpoint: created, secret: created.secret, created: true, replaced: Boolean(existing) }
 }
 
-/** Put a secret on the deployed Worker, without it ever reaching this output. */
-async function setWorkerSecret(name, value) {
-  const account = process.env.CLOUDFLARE_ACCOUNT_ID
-  const token = process.env.CLOUDFLARE_API_TOKEN
-  if (!account || !token) return false
-  const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/workers/scripts/${WORKER}/secrets`, {
-    method: 'PUT',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, text: value, type: 'secret_text' }),
-  })
-  const body = await res.json().catch(() => ({}))
-  if (!res.ok || body.success === false) {
-    console.warn(`  ! could not set ${name} on the Worker: ${body.errors?.[0]?.message || res.status}`)
-    return false
+/**
+ * Hand the values to wrangler, which is what knows how to turn a set of secrets
+ * into a deployed version. They go through a file in the system temp directory
+ * rather than the command line, so nothing sensitive is ever printed or left in
+ * shell history, and the file is deleted straight after.
+ */
+function setWorkerSecrets(values) {
+  const file = join(tmpdir(), `mapmycams-stripe-secrets-${process.pid}.json`)
+  writeFileSync(file, JSON.stringify(values), { mode: 0o600 })
+
+  const attempt = () => {
+    const bulk = runWrangler(['secret', 'bulk', file, '--name', WORKER])
+    if (bulk && bulk.status === 0) return Object.keys(values)
+    // Older wrangler, or one without `secret bulk`: a call per secret.
+    const done = []
+    for (const [name, value] of Object.entries(values)) {
+      const res = runWrangler(['secret', 'put', name, '--name', WORKER], value)
+      if (res && res.status === 0) done.push(name)
+    }
+    return done
   }
-  return true
+
+  try {
+    let done = attempt()
+    if (done.length !== Object.keys(values).length) {
+      // Cloudflare refuses secret edits while an undeployed version is the latest
+      // one; a plain deploy clears that state, after which the same edits apply.
+      console.log('  · an undeployed version is in the way — deploying and retrying')
+      runWrangler(['deploy'])
+      done = attempt()
+    }
+    return done
+  } finally {
+    rmSync(file, { force: true })
+  }
+}
+
+/** Run wrangler, preferring the package manager this project already uses. */
+function runWrangler(args, stdin) {
+  for (const [cmd, prefix] of [['bunx', []], ['npx', ['--no-install']]]) {
+    const res = spawnSync(cmd, [...prefix, 'wrangler', ...args], {
+      input: stdin ?? undefined,
+      stdio: stdin === undefined ? 'inherit' : ['pipe', 'inherit', 'inherit'],
+    })
+    if (res.error?.code === 'ENOENT') continue
+    return res
+  }
+  return null
 }
 
 console.log(`Stripe setup for ${APP_URL} (${mode} mode)\n`)
@@ -156,24 +221,16 @@ for (const def of CATALOGUE) {
 }
 
 console.log('\nWebhook')
-const { endpoint, secret, created, updated } = await ensureWebhook()
-console.log(`  ✓ ${endpoint.url}${created ? ' (created)' : updated ? ' (events updated)' : ' (already registered)'}`)
-if (!created) {
-  console.log('    Its signing secret cannot be read back — if it is not already set on the Worker,')
-  console.log('    copy it from Stripe → Developers → Webhooks → the endpoint → Signing secret.')
-}
+const { endpoint, secret, created, replaced } = await ensureWebhook()
+console.log(`  ✓ ${endpoint.url} ${created ? (replaced ? '(recreated, so the signing secret is valid)' : '(created)') : '(registered)'}`)
 
 console.log('\nWorker secrets')
-const values = { ...prices }
+const values = { ...prices, STRIPE_SECRET_KEY: key }
 if (secret) values.STRIPE_WEBHOOK_SECRET = secret
-values.STRIPE_SECRET_KEY = key
 
-const missing = []
-for (const [name, value] of Object.entries(values)) {
-  const ok = await setWorkerSecret(name, value)
-  if (!ok) missing.push(name)
-  else console.log(`  ✓ ${name}`)
-}
+const set = setWorkerSecrets(values)
+for (const name of Object.keys(values)) console.log(`  ${set.includes(name) ? '✓' : '!'} ${name}`)
+const missing = Object.keys(values).filter((n) => !set.includes(n))
 
 if (missing.length) {
   console.log('\nThese still have to be set on the Worker — Cloudflare → Workers & Pages →')

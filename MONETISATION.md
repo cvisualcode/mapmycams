@@ -230,12 +230,22 @@ hash, and never returns it to the client.
    webhook at `/webhooks/stripe` for `checkout.session.completed`,
    `customer.subscription.deleted` and `customer.subscription.paused`, and pushes
    every resulting secret (the price IDs, the webhook signing secret and the API
-   key) onto the Worker. It is idempotent — prices are matched by lookup key and
-   the endpoint by URL — so re-running it only creates what is missing.
+   key) onto the Worker. Re-running it is safe: products are matched by metadata
+   and prices by lookup key, so nothing is duplicated. The **webhook endpoint is
+   recreated** on each run, because Stripe reveals a signing secret exactly once,
+   when the endpoint is created — the Worker is handed the new one in the same run,
+   so the two can never drift apart.
    Start with a `sk_test_…` key: everything works in test mode with card
    `4242 4242 4242 4242`, any future expiry, any CVC, and no money moves. Replace
    that key with `sk_live_…`, run it again, and the same catalogue is created in
    live mode.
+   Each product is created with the **SaaS — personal use** tax code
+   (`txcd_10103000`). That is not decoration: a new Stripe account has Managed
+   Payments switched on, and Checkout refuses outright to sell a product with no
+   tax code ("the product tax code is missing"). If you would rather run without
+   Managed Payments, it can be turned off in Stripe → Settings → Managed Payments;
+   the code works either way, and re-running the script repairs a product whose
+   code is missing or different.
 3. **Deploy the API** — `bunx wrangler deploy`; the script has already set the
    bindings it needs.
 5. **Frontend** — deploy the static build (`bun run build` → `dist/`). Leave `VITE_API_URL` unset when the app and the API share an origin, which is the Cloudflare Worker case: the client then calls `/auth/*` on its own origin. Set it only when the API lives elsewhere — `.github/workflows/deploy.yml` does that for the Pages build, pointing it at `https://mapmycams.dev`.
