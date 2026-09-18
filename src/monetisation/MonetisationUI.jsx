@@ -223,10 +223,55 @@ export function VerifyEmailScreen({ email, devCode, deliveryError, onSubmit, onR
   )
 }
 
+/**
+ * Buy something, and always report what happened.
+ *
+ * A purchase can end three ways: the browser leaves for Stripe, the plan is
+ * unlocked locally because nothing on this host can charge, or something failed
+ * with a reason worth reading. Showing all three is the difference between a
+ * working button and one that looks broken — a silent demo grant is
+ * indistinguishable from a dead button.
+ */
+function useCheckout() {
+  const ent = useEntitlements()
+  const [busy, setBusy] = useState(null)
+  const [notice, setNotice] = useState(null)
+
+  async function buy(item, kind) {
+    setNotice(null)
+    setBusy(item)
+    try {
+      const res = await ent.startCheckout(item, kind)
+      if (res?.redirecting) return // the browser is on its way to Stripe
+      setNotice(res?.demo
+        ? { kind: 'demo', text: 'Demo mode: nothing on this host can take a payment, so this was unlocked in this browser only — it will not follow you to another device.' }
+        : { kind: 'error', text: 'Stripe did not return a checkout page — please try again.' })
+    } catch (err) {
+      setNotice({ kind: 'error', text: err?.message || 'Could not start the checkout.' })
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return { buy, busy, notice, dismiss: () => setNotice(null) }
+}
+
+/** A one-line answer to "what just happened when I clicked that?" */
+function CheckoutNotice({ notice, onDismiss }) {
+  if (!notice) return null
+  return (
+    <div className={`checkout-notice ${notice.kind}`}>
+      <span>{notice.text}</span>
+      <button className="checkout-notice-close" onClick={onDismiss}>✕</button>
+    </div>
+  )
+}
+
 // ─── Upgrade modal ───────────────────────────────────────────────────────────
 
 export function UpgradeModal() {
   const ent = useEntitlements()
+  const { buy, busy, notice, dismiss } = useCheckout()
   if (!ent.upgrade) return null
   const { title, reason } = ent.upgrade
   const monthly = PLANS.find((p) => p.key === 'premium_monthly')
@@ -241,7 +286,10 @@ export function UpgradeModal() {
           {monthly.features.slice(0, 5).map((f) => <li key={f}>{f}</li>)}
         </ul>
         <div className="upgrade-price">{formatPrice(monthly.price)}<span>/{monthly.period}</span></div>
-        <button className="btn-primary" onClick={() => ent.startCheckout('premium_monthly', 'plan').then(ent.closeUpgrade)}>Upgrade now</button>
+        <CheckoutNotice notice={notice} onDismiss={dismiss} />
+        <button className="btn-primary" disabled={busy === 'premium_monthly'} onClick={() => buy('premium_monthly', 'plan')}>
+          {busy === 'premium_monthly' ? 'Opening Stripe…' : 'Upgrade now'}
+        </button>
         <button className="btn-ghost" onClick={ent.closeUpgrade}>Maybe later</button>
       </div>
     </div>
@@ -252,6 +300,7 @@ export function UpgradeModal() {
 
 export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing }) {
   const ent = useEntitlements()
+  const { buy, busy, notice, dismiss } = useCheckout()
   const [billing, setBilling] = useState([])
   const [twoFA, setTwoFA] = useState(false)
 
@@ -275,6 +324,7 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing }) {
       </header>
 
       <div className="dash-grid">
+        <CheckoutNotice notice={notice} onDismiss={dismiss} />
         {ent.checkoutNotice && (
           <div className={`checkout-notice ${ent.checkoutNotice}`}>
             <span>
@@ -348,7 +398,9 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing }) {
             return (
               <div className="fp-row" key={a.key}>
                 <span>{a.name}</span><span>{formatPrice(a.price)}</span>
-                {owned ? <span className="plan-chip">Owned</span> : <button onClick={() => ent.startCheckout(a.key, 'addon')}>Buy</button>}
+                {owned
+                  ? <span className="plan-chip">Owned</span>
+                  : <button disabled={busy === a.key} onClick={() => buy(a.key, 'addon')}>{busy === a.key ? 'Opening…' : 'Buy'}</button>}
               </div>
             )
           })}
@@ -362,6 +414,10 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing }) {
 
 export function PricingPage({ onBack }) {
   const ent = useEntitlements()
+  const { buy, busy, notice, dismiss } = useCheckout()
+  const currentPlan = ent.user?.plan || 'free'
+  const owned = ent.user?.addons || []
+
   return (
     <div className="pricing-page">
       <header className="dash-header">
@@ -369,33 +425,46 @@ export function PricingPage({ onBack }) {
         <button className="btn-ghost" onClick={onBack}>← Back</button>
       </header>
       <h1>Plans &amp; pricing</h1>
+      <CheckoutNotice notice={notice} onDismiss={dismiss} />
       <div className="pricing-grid">
-        {PLANS.map((p) => (
-          <div className={`price-card${p.highlight ? ' highlighted' : ''}`} key={p.key}>
-            {p.highlight && <div className="price-flag">Most popular</div>}
-            <h2>{p.name}</h2>
-            <div className="price-big">{formatPrice(p.price)}<span>/{p.period}</span></div>
-            <p className="spec-hint">{p.blurb}</p>
-            <ul>{p.features.map((f) => <li key={f}>{f}</li>)}</ul>
-            <button
-              className="btn-primary"
-              onClick={() => ent.startCheckout(p.key, 'plan')}
-            >
-              {p.price === 0 ? 'Current (Free)' : `Choose ${p.name}`}
-            </button>
-          </div>
-        ))}
+        {PLANS.map((p) => {
+          const isCurrent = currentPlan === p.key
+          return (
+            <div className={`price-card${p.highlight ? ' highlighted' : ''}${isCurrent ? ' current' : ''}`} key={p.key}>
+              {p.highlight && !isCurrent && <div className="price-flag">Most popular</div>}
+              <h2>{p.name}</h2>
+              <div className="price-big">{formatPrice(p.price)}<span>/{p.period}</span></div>
+              <p className="spec-hint">{p.blurb}</p>
+              <ul>{p.features.map((f) => <li key={f}>{f}</li>)}</ul>
+              <button
+                className="btn-primary"
+                disabled={isCurrent || busy === p.key}
+                onClick={() => buy(p.key, 'plan')}
+              >
+                {busy === p.key ? 'Opening Stripe…' : isCurrent ? 'Your current plan' : `Choose ${p.name}`}
+              </button>
+              {isCurrent && p.key !== 'free' && (
+                <p className="spec-hint">Billed by Stripe. Change the card or cancel from the dashboard.</p>
+              )}
+            </div>
+          )
+        })}
       </div>
       <h2 style={{ textAlign: 'center', marginTop: 32 }}>One-time add-ons</h2>
       <div className="addons-grid">
-        {ADDONS.map((a) => (
-          <div className="price-card addon" key={a.key}>
-            <h2>{a.name}</h2>
-            <div className="price-big">{formatPrice(a.price)}<span> once</span></div>
-            <p className="spec-hint">{a.blurb}</p>
-            <button className="btn-primary" onClick={() => ent.startCheckout(a.key, 'addon')}>Buy add-on</button>
-          </div>
-        ))}
+        {ADDONS.map((a) => {
+          const has = owned.includes(a.key)
+          return (
+            <div className="price-card addon" key={a.key}>
+              <h2>{a.name}</h2>
+              <div className="price-big">{formatPrice(a.price)}<span> once</span></div>
+              <p className="spec-hint">{a.blurb}</p>
+              <button className="btn-primary" disabled={has || busy === a.key} onClick={() => buy(a.key, 'addon')}>
+                {busy === a.key ? 'Opening Stripe…' : has ? 'Owned' : 'Buy add-on'}
+              </button>
+            </div>
+          )
+        })}
       </div>
     </div>
   )

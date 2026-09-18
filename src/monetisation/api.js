@@ -839,37 +839,80 @@ function goToStripe(url) {
   return true
 }
 
-/** Start a Stripe checkout (subscription plan or one-time add-on). */
-export async function startCheckout(itemKey, kind = 'plan') {
-  track('checkout_started', { item: itemKey, kind })
-  let res = null
-  try { res = await api('/billing/checkout', { item: itemKey, kind }) } catch (e) { if (e.message !== 'demo') throw e }
-
-  // Real mode: the server created a Stripe Checkout Session. Card details are
-  // only ever entered on Stripe's page, and nothing is unlocked until the
-  // payment completes and the app confirms it on the way back.
-  if (res?.url) {
-    track('checkout_redirected', { item: itemKey, kind })
-    return { redirecting: goToStripe(res.url), url: res.url }
+/**
+ * Is there a JSON API on this origin?
+ *
+ * The sandbox preview and any static-only host have none, and the answer decides
+ * whether a purchase can actually be charged for. Probed once per page load: the
+ * request is unauthenticated, so an API answers `401` with JSON and a host with
+ * no API answers with HTML (or nothing at all).
+ */
+let apiProbe = null
+export function apiAvailable() {
+  if (apiProbe === null) {
+    apiProbe = fetch(`${API_URL}/me`, { headers: serverHeaders() })
+      .then((res) => (res.headers.get('content-type') || '').includes('application/json'))
+      .catch(() => false)
   }
+  return apiProbe
+}
 
-  // Demo mode: instantly grant the entitlement so the flow is testable
+/** Unlock something in this browser alone — the demo path, when nothing can charge. */
+function grantLocally(itemKey, kind) {
   const user = sessionUser()
   if (!user) throw new Error('Sign in first')
   const db = loadDB()
   const u = db.users[user.id]
+  db.billing[user.id] = db.billing[user.id] || []
   if (kind === 'addon') {
     u.addons = [...new Set([...(u.addons || []), itemKey])]
-    db.billing[user.id] = db.billing[user.id] || []
     db.billing[user.id].unshift({ id: 'inv_' + Date.now(), item: itemKey, kind: 'addon', amount: itemKey, date: new Date().toISOString(), status: 'paid' })
   } else {
     u.plan = itemKey
-    db.billing[user.id] = db.billing[user.id] || []
     db.billing[user.id].unshift({ id: 'sub_' + Date.now(), item: itemKey, kind: 'subscription', amount: itemKey, date: new Date().toISOString(), status: 'active' })
   }
   saveDB(db)
   track('checkout_completed', { item: itemKey, kind, demo: true })
-  return { demo: true }
+  return { demo: true, user: publicUser(u) }
+}
+
+/**
+ * Start a Stripe checkout (subscription plan or one-time add-on).
+ *
+ * Every outcome is reported back to the caller — redirecting, demo, or a thrown
+ * error with something the customer can act on. A button that quietly does
+ * nothing is indistinguishable from a broken one, which is exactly how this
+ * behaved when a purchase could not be charged for.
+ */
+export async function startCheckout(itemKey, kind = 'plan') {
+  track('checkout_started', { item: itemKey, kind })
+
+  // No server session. Either this host has no API at all (the preview, a static
+  // host), or the account is one of this browser's own — signed in locally, with
+  // no account on the server for a payment to belong to. Buying is only possible
+  // for the second case by verifying the address first, so say so rather than
+  // unlocking something the server will never know about.
+  if (!serverToken()) {
+    if (await apiAvailable()) {
+      throw new Error('Buying needs a verified account. Sign out and create one with your email address — we email a code to confirm it — then the plan can be paid for and will follow you to any device.')
+    }
+    return grantLocally(itemKey, kind)
+  }
+
+  // Real mode: the server creates a Stripe Checkout Session and the browser pays
+  // on Stripe's own page. Nothing is unlocked until the payment completes and the
+  // app confirms it on the way back (see confirmCheckout).
+  const res = await api('/billing/checkout', { item: itemKey, kind })
+  if (res?.url) {
+    track('checkout_redirected', { item: itemKey, kind, checkout: true })
+    return { redirecting: goToStripe(res.url), url: res.url }
+  }
+  if (res?.demo) {
+    // The server is reachable but has no Stripe keys, so it granted the plan
+    // itself. Report that rather than leaving the page looking untouched.
+    return { demo: true, server: true, user: res.user || await getMe() }
+  }
+  throw new Error('Stripe did not return a checkout page — please try again')
 }
 
 /**

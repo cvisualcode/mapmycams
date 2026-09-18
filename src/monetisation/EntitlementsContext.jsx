@@ -145,11 +145,10 @@ export function EntitlementsProvider({ children }) {
     async startCheckout(item, kind) {
       const res = await api.startCheckout(item, kind)
       // Paid mode sends the browser to Stripe, so the entitlement arrives on the
-      // way back (see the return handler above) — not from this call.
-      if (res && res.demo) {
-        const me = await api.getMe()
-        setUser(me)
-      }
+      // way back (see the return handler above) — not from this call. A demo grant
+      // comes back with the updated account, and a failure throws for the caller
+      // to show, rather than looking like a button that does nothing.
+      if (res?.demo) setUser(res.user || await api.getMe())
       return res
     },
     checkoutNotice,
