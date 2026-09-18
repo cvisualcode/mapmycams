@@ -21,9 +21,13 @@ const CORS = { 'Access-Control-Allow-Origin': '*' }
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...CORS } })
 
-/** Reject calls from other sites, so this can't casually be used as a relay. */
+/**
+ * Reject calls from anywhere but the app itself, so this can't casually be used
+ * as a mail relay. A *missing* Origin is rejected as well: browsers always send
+ * one on POST, so "absent means trusted" only ever helped scripted clients.
+ */
 function originAllowed(origin) {
-  if (!origin) return true // same-origin fetches may omit it
+  if (!origin) return false
   return /^https?:\/\/([a-z0-9-]+\.)?(mapmycams\.dev|mapmycams\.pages\.dev|localhost(:\d+)?)$/i.test(origin)
 }
 

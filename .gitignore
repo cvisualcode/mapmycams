@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# Local secrets — never commit. .env holds RESEND_API_KEY and the Cloudflare
+# token; .dev.vars is wrangler's equivalent.
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -92,12 +92,54 @@ still stored locally. The key stays server-side.
   ```
   `wrangler.jsonc` runs `api/index.js` as the worker and routes `/auth/*` (plus
   the other API paths) to it before the SPA fallback serves `index.html`.
+- **Cloudflare Pages** (a Pages project ignores `wrangler.jsonc`'s `main`;
+  server code there must live in `functions/`): `functions/auth/send-code.js` is
+  routed to `/auth/send-code` by its file path, and `public/_routes.json` keeps
+  static assets off the Function so only `/auth/*` invokes it. Set the same two
+  variables in **Settings → Variables and Secrets → Production**.
 - **Any other host**: deploy `api/` as a fetch handler and point
   `VITE_MAILER_URL` at it (build-time env var).
+
+Two things that cost real time when wiring production:
+
+- **Environment changes need a new deployment.** On Pages, variables only apply
+  to a build created after they were added — retry the deployment
+  (Deployments → ⋯ → Retry deployment), don't just reload the site. On a Worker,
+  `wrangler deploy` again.
+- **The sender address must be at the verified domain, and the variable must be
+  named exactly `EMAIL_FROM`.** Resend guides sometimes use
+  `RESEND_EMAIL_FROM`; a name that doesn't match keeps reporting "not
+  configured" and reads like a broken deploy.
+
+Domain verification only needs the **DKIM TXT** record — Resend accepted a send
+with the SPF TXT and MX absent, and the code still reached the inbox. Add them
+anyway when convenient: SPF improves inbox placement at strict consumer
+providers, and the MX is what lets Resend report bounces to you instead of them
+vanishing silently. Neither is required to send.
 
 The client defaults to the same origin (`/auth/send-code`), so on Cloudflare no
 configuration is needed. If the mailer is unreachable the code screen falls back
 to showing the code — signup never breaks because email is down.
+
+### Keeping the mailer from being abused
+
+Once `RESEND_API_KEY` is set, `/auth/send-code` sends real mail from the
+verified domain and accepts an attacker-chosen recipient *and* code. Before the
+key existed that was harmless; afterwards it is a mail relay. Two guards are in
+place, in both `api/index.js` and `functions/auth/send-code.js`:
+
+- **`Origin` is required and checked** against an allowlist (`mapmycams.dev`,
+  `*.pages.dev`, `localhost`). A *missing* `Origin` is rejected as well —
+  browsers always send one on POST, so "absent means trusted" only ever helped
+  scripted clients.
+- **`workers_dev: false` and `preview_urls: false`** in `wrangler.jsonc`, so the
+  `*.workers.dev` and preview URLs are no longer public second doors around the
+  domain. The Custom Domain is unaffected — it is not a wrangler-managed route,
+  which is why deploys report `No targets deployed` yet still serve the site.
+
+Neither guard replaces generating the code **server-side**, which is the real
+fix: with no database there is nothing server-side for a code to belong to, so
+the route stays a (now narrow) way to send a fixed 6-digit message.
 
 Once Supabase is connected, `/auth/signup` generates and sends the code itself
 and never returns it to the client; the mailer route is then unused.

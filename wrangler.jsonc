@@ -2,6 +2,12 @@
   "name": "mapmycams",
   "main": "api/index.js",
   "compatibility_date": "2026-08-15",
+  // The mailer endpoint can send real email from the verified domain, so the
+  // *.workers.dev and preview URLs are switched off: they are extra public
+  // entry points that bypass the custom domain. The domain is a Custom Domain
+  // (not a wrangler-managed route), so it is unaffected by these settings.
+  "workers_dev": false,
+  "preview_urls": false,
   "assets": {
     "directory": "./dist",
     "not_found_handling": "single-page-application",

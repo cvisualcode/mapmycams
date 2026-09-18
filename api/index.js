@@ -30,6 +30,20 @@ const PRICE_MAP = () => ({
   brands: { price: globalThis.env.PRICE_BRANDS, mode: 'payment' },
 })
 
+/** The only origins allowed to reach the verification mailer. */
+const MAILER_ORIGIN = /^https?:\/\/([a-z0-9-]+\.)?(mapmycams\.dev|mapmycams\.pages\.dev|localhost(:\d+)?)$/i
+
+/**
+ * The mailer sends real mail from the verified domain, so only the app itself
+ * may call it. A *missing* Origin is rejected too: browsers always send one on
+ * POST, and treating "absent" as trusted is exactly what would let a scripted
+ * client use this route as a mail relay.
+ */
+function mailerOriginAllowed(request) {
+  const origin = request.headers.get('Origin')
+  return Boolean(origin) && MAILER_ORIGIN.test(origin)
+}
+
 async function authUser(request) {
   const token = (request.headers.get('Authorization') || '').replace('Bearer ', '')
   const userId = token && await verifyToken(token)
@@ -139,6 +153,7 @@ async function handle(request, env) {
   // the sending is server-side, which is what keeps RESEND_API_KEY secret.
   // Once Supabase is connected the routes above take over and this is unused.
   if (path === '/auth/send-code' && method === 'POST') {
+    if (!mailerOriginAllowed(request)) return json({ sent: false, error: 'Origin not allowed' }, 403)
     const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('x-forwarded-for') || 'unknown'
     if (!rateLimit(`mail:${ip}`, 5)) return json({ sent: false, error: 'Too many codes requested — try again in a minute' }, 429)
     const { email, code, name } = await request.json().catch(() => ({}))
