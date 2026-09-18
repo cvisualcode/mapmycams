@@ -18,7 +18,6 @@ const PRICES = {
   PRICE_PREMIUM_YEARLY: 'price_yearly_test',
   PRICE_AI_PACK: 'price_ai_test',
   PRICE_PDF_REPORT: 'price_pdf_test',
-  PRICE_FAMILY: 'price_family_test',
   PRICE_BRANDS: 'price_brands_test',
 }
 
@@ -192,13 +191,13 @@ async function postWebhook(event, secret = WEBHOOK_SECRET) {
   return { status: res.status, data: await res.json().catch(() => null) }
 }
 
-const forged = await postWebhook({ type: 'checkout.session.completed', data: { object: { client_reference_id: bobId, mode: 'payment', metadata: { item: 'family' } } } }, 'whsec_wrong')
+const forged = await postWebhook({ type: 'checkout.session.completed', data: { object: { client_reference_id: bobId, mode: 'payment', metadata: { item: 'brands' } } } }, 'whsec_wrong')
 check('a forged signature is rejected', forged.status === 400)
 
-const granted = await postWebhook({ type: 'checkout.session.completed', data: { object: { client_reference_id: bobId, mode: 'payment', customer: 'cus_bob', metadata: { item: 'family' } } } })
+const granted = await postWebhook({ type: 'checkout.session.completed', data: { object: { client_reference_id: bobId, mode: 'payment', customer: 'cus_bob', metadata: { item: 'brands' } } } })
 check('the webhook is accepted', granted.status === 200 && granted.data?.received === true)
 const bobAfter = await call('/me', { method: 'GET', token: bob.token })
-check('the webhook grants the add-on', (bobAfter.data?.addons || []).includes('family'), JSON.stringify(bobAfter.data))
+check('the webhook grants the add-on', (bobAfter.data?.addons || []).includes('brands'), JSON.stringify(bobAfter.data))
 
 await postWebhook({ type: 'checkout.session.completed', data: { object: { client_reference_id: bobId, mode: 'subscription', customer: 'cus_bob', metadata: { item: 'premium_monthly' } } } })
 const bobPremium = await call('/me', { method: 'GET', token: bob.token })

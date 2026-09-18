@@ -27,7 +27,6 @@ const CATALOGUE = [
   { item: 'premium_yearly', env: 'PRICE_PREMIUM_YEARLY', name: 'MapMyCams Premium (Yearly)', amount: 4900, interval: 'year' },
   { item: 'ai_pack', env: 'PRICE_AI_PACK', name: 'Advanced AI Analysis Pack', amount: 799 },
   { item: 'pdf_report', env: 'PRICE_PDF_REPORT', name: 'Professional PDF Report', amount: 499 },
-  { item: 'family', env: 'PRICE_FAMILY', name: 'Family Sharing', amount: 299 },
   { item: 'brands', env: 'PRICE_BRANDS', name: 'Camera Brand Integration Pack', amount: 699 },
 ]
 

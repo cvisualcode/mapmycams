@@ -25,18 +25,18 @@ import {
 } from './_lib.js'
 
 // Stripe price IDs come from env: PRICE_PREMIUM_MONTHLY, PRICE_PREMIUM_YEARLY,
-// PRICE_AI_PACK, PRICE_PDF_REPORT, PRICE_FAMILY, PRICE_BRANDS.
+// PRICE_AI_PACK, PRICE_PDF_REPORT, PRICE_BRANDS. Family Sharing was dropped: the
+// tool never had household seats behind it, so it was not something to sell.
 const PRICE_MAP = () => ({
   premium_monthly: { price: globalThis.env.PRICE_PREMIUM_MONTHLY, mode: 'subscription' },
   premium_yearly: { price: globalThis.env.PRICE_PREMIUM_YEARLY, mode: 'subscription' },
   ai_pack: { price: globalThis.env.PRICE_AI_PACK, mode: 'payment' },
   pdf_report: { price: globalThis.env.PRICE_PDF_REPORT, mode: 'payment' },
-  family: { price: globalThis.env.PRICE_FAMILY, mode: 'payment' },
   brands: { price: globalThis.env.PRICE_BRANDS, mode: 'payment' },
 })
 
 /** The one-off add-ons, used when there are no Stripe prices to read a mode from. */
-const ADDON_ITEMS = ['ai_pack', 'pdf_report', 'family', 'brands']
+const ADDON_ITEMS = ['ai_pack', 'pdf_report', 'brands']
 
 /** True for a plan key, false for an add-on key. */
 const isAddon = (item) => ADDON_ITEMS.includes(item)

@@ -346,8 +346,8 @@ function loadDB() {
     users: {
       u_admin: {
         id: 'u_admin', identifier: 'Admin', email: 'admin@mapmycams.dev', name: 'Administrator',
-        isAdmin: true, passHash: legacyHash(SEED_ADMIN_PASSWORD),
-        plan: 'premium_yearly', addons: ['ai_pack', 'pdf_report', 'family', 'brands'],
+      isAdmin: true, passHash: legacyHash(SEED_ADMIN_PASSWORD),
+      plan: 'premium_yearly', addons: ['ai_pack', 'pdf_report', 'brands'],
         twoFA: false, emailVerified: true, createdAt: new Date().toISOString(),
       },
     },
@@ -578,7 +578,7 @@ export async function login(identifier, password) {
     // The server doesn't know this account — but one created here before the
     // server existed, or on a host that has none, is still valid in this browser.
     // A wrong password fails both ways, so this cannot sign anyone in falsely.
-    const local = await loginLocally(id, password).catch(() => null)
+    const local = await loginLocally(id, password, { allowDemoAdmin: !(await apiAvailable()) }).catch(() => null)
     if (local) return local
     throw new Error(live.data.error || 'Invalid email/username or password')
   }
@@ -587,7 +587,7 @@ export async function login(identifier, password) {
 }
 
 /** Sign in against the accounts stored in this browser (no server involved). */
-async function loginLocally(id, password) {
+async function loginLocally(id, password, { allowDemoAdmin = true } = {}) {
   const db = loadDB()
   const user = findUser(db, id)
   // Throttle by account id when the account exists, so switching between
@@ -606,6 +606,11 @@ async function loginLocally(id, password) {
     ? 'Invalid email/username or password'
     : 'Invalid email/username or password. Note: this browser is blocking local storage, so accounts created here are not kept — open the preview in its own browser tab and create the account again.')
   if (!user) { recordFailure(db, key); throw invalid }
+
+  // Admin / Admin1 is a development account. Where a real account service is
+  // answering, honouring it would hand every paid feature to anyone who typed two
+  // words, so it is refused there and only works with no server to sign in to.
+  if (!allowDemoAdmin && user.isAdmin) { recordFailure(db, key); throw invalid }
 
   const { ok, needsRehash } = await verifyPassword(password, user.passHash)
   if (!ok) { recordFailure(db, key); throw invalid }
@@ -809,7 +814,15 @@ export async function getMe() {
       else return null
     }
   }
-  return publicUser(sessionUser())
+  const local = publicUser(sessionUser())
+  // A session for the seeded Admin predates the account service, and on a
+  // deployed host it would be a standing free pass to every paid feature. Drop it
+  // rather than honour it — the demo account only exists where there is no server.
+  if (local?.isAdmin && await apiAvailable()) {
+    clearSession()
+    return null
+  }
+  return local
 }
 
 // ─── Billing ─────────────────────────────────────────────────────────────────

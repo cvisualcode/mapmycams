@@ -30,6 +30,14 @@ export function LoginScreen() {
   const [showPassword, setShowPassword] = useState(false)
   // Empty unless this browser is refusing to store data — see api.storageNotice().
   const storageWarning = api.storageNotice()
+  // True once the account service answers here. The demo Admin account is a
+  // development tool, so it is only offered where there is nothing to sign in to.
+  const [hasApi, setHasApi] = useState(false)
+  useEffect(() => {
+    let live = true
+    api.apiAvailable().then((ok) => { if (live) setHasApi(ok) })
+    return () => { live = false }
+  }, [])
 
   /** Sign in, or create an account, with email + password. */
   async function submit(e) {
@@ -88,9 +96,11 @@ export function LoginScreen() {
           <button className="auth-btn" disabled={busy}>{busy ? 'Please wait…' : tab === 'login' ? 'Sign in' : 'Create account'}</button>
         </form>
 
-        <button className="auth-admin" onClick={demoAdmin} title="Pre-built full-access admin account — Admin / Admin1">
-          ⭐ Sign in as Admin (Admin / Admin1)
-        </button>
+        {!hasApi && (
+          <button className="auth-admin" onClick={demoAdmin} title="Pre-built full-access admin account — Admin / Admin1">
+            ⭐ Sign in as Admin (Admin / Admin1)
+          </button>
+        )}
 
         <p className="auth-switch">
           {tab === 'login' ? (
@@ -471,8 +481,12 @@ export function UpgradeModal() {
   const ent = useEntitlements()
   const { buy, busy, notice, dismiss } = useCheckout()
   if (!ent.upgrade) return null
-  const { title, reason } = ent.upgrade
-  const monthly = PLANS.find((p) => p.key === 'premium_monthly')
+  const { title, reason, item } = ent.upgrade
+  // Sell whatever was actually clicked. Pointing every prompt at Premium meant a
+  // locked camera brand, which is covered by a £6.99 add-on, never offered it.
+  const addon = ADDONS.find((a) => a.key === item) || null
+  const plan = addon ? null : (PLANS.find((p) => p.key === item && p.key !== 'free') || PLANS.find((p) => p.key === 'premium_monthly'))
+  const target = addon || plan
   return (
     <div className="modal-backdrop" onClick={ent.closeUpgrade}>
       <div className="modal upgrade-modal" onClick={(e) => e.stopPropagation()}>
@@ -480,14 +494,27 @@ export function UpgradeModal() {
         <div className="upgrade-padlock"><Padlock /></div>
         <h2>{title}</h2>
         <p className="upgrade-reason">{reason}</p>
-        <ul className="upgrade-list">
-          {monthly.features.slice(0, 5).map((f) => <li key={f}>{f}</li>)}
-        </ul>
-        <div className="upgrade-price">{formatPrice(monthly.price)}<span>/{monthly.period}</span></div>
+        {addon ? (
+          <>
+            <p className="upgrade-buy-name">{addon.name}</p>
+            <div className="upgrade-price">{formatPrice(addon.price)}<span> once</span></div>
+            <p className="spec-hint">{addon.blurb}</p>
+          </>
+        ) : (
+          <>
+            <ul className="upgrade-list">
+              {plan.features.slice(0, 6).map((f) => <li key={f}>{f}</li>)}
+            </ul>
+            <div className="upgrade-price">{formatPrice(plan.price)}<span>/{plan.period}</span></div>
+          </>
+        )}
         <CheckoutNotice notice={notice} onDismiss={dismiss} />
-        <button className="btn-primary" disabled={busy === 'premium_monthly'} onClick={() => buy('premium_monthly', 'plan')}>
-          {busy === 'premium_monthly' ? 'Opening Stripe…' : 'Upgrade now'}
+        <button className="btn-primary" disabled={busy === target.key} onClick={() => buy(target.key, addon ? 'addon' : 'plan')}>
+          {busy === target.key ? 'Opening Stripe…' : addon ? `Buy the ${addon.name}` : `Upgrade to ${plan.name}`}
         </button>
+        {addon && (
+          <button className="btn-ghost" onClick={() => { ent.closeUpgrade(); buy('premium_monthly', 'plan') }}>Or get everything with Premium</button>
+        )}
         <button className="btn-ghost" onClick={ent.closeUpgrade}>Maybe later</button>
       </div>
     </div>
