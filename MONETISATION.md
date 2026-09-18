@@ -121,6 +121,33 @@ The client defaults to the same origin (`/auth/send-code`), so on Cloudflare no
 configuration is needed. If the mailer is unreachable the code screen falls back
 to showing the code — signup never breaks because email is down.
 
+### Where the mailer is wired right now (verified)
+
+Both targets are live and accepting sends, confirmed against the real endpoint:
+
+| Host | Serves | `POST /auth/send-code` |
+|---|---|---|
+| `mapmycams.dev` | Worker (`api/index.js`) on a Custom Domain | `{"sent":true}` |
+| `mapmycams.pages.dev` | Pages project `mapmycams` + `functions/` | `{"sent":true}` |
+
+A request with no `Origin`, or a foreign one, is `403 Origin not allowed` on
+both. All three builds — Worker, Pages and a local `vite build` — produce the
+same asset hash, so what is live matches `main`.
+
+Two details of that setup that are easy to trip over:
+
+- **Pages deploys from GitHub, not from this sandbox.**
+  `.github/workflows/deploy.yml` runs the build and `wrangler pages deploy dist`
+  on every push to `main`, using the `CLOUDFLARE_API_TOKEN` /
+  `CLOUDFLARE_ACCOUNT_ID` repository secrets. Its variables were applied via the
+  Cloudflare API — to **both** production and preview, because the API rejects a
+  PATCH where the two environments disagree on `fail_open` — and only took
+  effect on the deployment that followed. The **Worker is deployed by hand**
+  (`bunx wrangler deploy`), so a push does *not* update the domain.
+- **The two variables are per-project bindings.** A Worker secret does nothing
+  for Pages, which is exactly why `.pages.dev` kept reporting the key missing
+  while the domain already worked. Set them on each target.
+
 ### Keeping the mailer from being abused
 
 Once `RESEND_API_KEY` is set, `/auth/send-code` sends real mail from the
