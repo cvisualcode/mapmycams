@@ -261,30 +261,58 @@ const STRIPE_SECRET = () => globalThis.env?.STRIPE_SECRET_KEY
 /** False until real prices and a secret key exist — billing then runs in demo mode. */
 export const stripeConfigured = () => Boolean(STRIPE_SECRET())
 
-async function stripeFetch(path, params) {
-  const res = await fetch(`https://api.stripe.com/v1/${path}`, {
-    method: 'POST',
+const APP_URL = () => globalThis.env?.APP_URL || ''
+
+async function stripeFetch(path, params, method = 'POST') {
+  const query = method === 'GET' && params ? `?${new URLSearchParams(params)}` : ''
+  const res = await fetch(`https://api.stripe.com/v1/${path}${query}`, {
+    method,
     headers: {
       Authorization: `Bearer ${STRIPE_SECRET()}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body: new URLSearchParams(params).toString(),
+    body: method === 'GET' ? undefined : new URLSearchParams(params || {}).toString(),
   })
   if (!res.ok) throw new Error(`Stripe ${path}: ${res.status} ${await res.text()}`)
   return res.json()
 }
 
-export async function stripeCheckoutSession({ priceId, userId, email, mode }) {
-  return stripeFetch('checkout/sessions', {
+/**
+ * Create a Checkout Session. The browser is sent to Stripe's own page to pay;
+ * nothing is granted until a payment completes, which is reported either by the
+ * webhook or by the account app asking Stripe about the session on return.
+ */
+export async function stripeCheckoutSession({ priceId, userId, email, mode, item }) {
+  const params = {
     mode, // 'subscription' | 'payment'
     'line_items[0][price]': priceId,
     'line_items[0][quantity]': '1',
     client_reference_id: userId,
     customer_email: email,
-    success_url: `${globalThis.env?.APP_URL || ''}/?checkout=success`,
-    cancel_url: `${globalThis.env?.APP_URL || ''}/?checkout=cancelled`,
+    // Stripe fills {CHECKOUT_SESSION_ID} in, so the app can confirm the purchase
+    // itself instead of waiting for the webhook to land.
+    success_url: `${APP_URL()}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${APP_URL()}/?checkout=cancelled`,
     'metadata[userId]': userId,
-  })
+    'metadata[item]': item,
+  }
+  // A subscription outlives the session that created it, and cancellation comes
+  // back as a customer.subscription.* event whose metadata is taken from here —
+  // not from the session — so the userId has to be copied onto the subscription
+  // too, or nothing would be able to match the cancellation to an account.
+  if (mode === 'subscription') params['subscription_data[metadata][userId]'] = userId
+  return stripeFetch('checkout/sessions', params)
+}
+
+/** Read a session back, so the app can confirm a purchase without the webhook. */
+export async function stripeGetSession(sessionId) {
+  return stripeFetch(`checkout/sessions/${encodeURIComponent(sessionId)}`, null, 'GET')
+}
+
+/** Recent invoices for the billing history panel. */
+export async function stripeListInvoices(customerId, limit = 12) {
+  const { data } = await stripeFetch('invoices', { customer: customerId, limit: String(limit) }, 'GET')
+  return data || []
 }
 
 export async function stripePortalSession(customerId) {

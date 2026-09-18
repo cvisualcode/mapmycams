@@ -17,8 +17,14 @@ src/App.jsx                 ← the floorplan editor (gated: camera limit, water
 api/
   _lib.js                   ← JWT, credentials, Cloudflare KV store, Resend + Stripe
   index.js                  ← all API endpoints
+  email-template.js         ← the verification email body
   schema.sql                ← Postgres alternative — not used (see “Where accounts live”)
   supabase_auth.sql         ← profiles table + RLS + trigger, for the Supabase OAuth path
+functions/auth/send-code.js ← Pages Function: the same mailer on *.pages.dev
+scripts/
+  stripe-setup.mjs          ← creates the Stripe products, prices and webhook
+  test-billing.mjs          ← billing smoke test (Stripe stubbed out, no account needed)
+  test-email.mjs            ← sends one real verification code, to prove Resend works
 ```
 
 ## Where accounts live (Cloudflare KV)
@@ -216,12 +222,69 @@ hash, and never returns it to the client.
 ## Production setup
 
 1. **Account storage** — one Cloudflare KV namespace, already bound in `wrangler.jsonc` as `MAPMYCAMS_STORE` (`bunx wrangler kv namespace create MAPMYCAMS_STORE`, then paste the id into the config). Nothing to provision by hand; `api/schema.sql` is the Postgres/Supabase alternative and is *not* used by this build.
-2. **Stripe** — create products/prices (Premium Monthly, Premium Yearly, and the four one-time add-ons). Copy the price IDs.
-3. **Webhook** — add a Stripe webhook endpoint at `<your-domain>/webhooks/stripe` for `checkout.session.completed`, `customer.subscription.deleted`. Copy the signing secret.
-4. **Deploy the API** — the `api/` folder is a Cloudflare Worker module (`wrangler deploy`) or can be adapted to any Node serverless platform.
+2. **Stripe** — one command does the whole account side:
+   ```bash
+   bun run stripe:setup      # needs STRIPE_SECRET_KEY in Settings → Environment
+   ```
+   It creates both Premium prices and all four add-ons in GBP, registers the
+   webhook at `/webhooks/stripe` for `checkout.session.completed`,
+   `customer.subscription.deleted` and `customer.subscription.paused`, and pushes
+   every resulting secret (the price IDs, the webhook signing secret and the API
+   key) onto the Worker. It is idempotent — prices are matched by lookup key and
+   the endpoint by URL — so re-running it only creates what is missing.
+   Start with a `sk_test_…` key: everything works in test mode with card
+   `4242 4242 4242 4242`, any future expiry, any CVC, and no money moves. Replace
+   that key with `sk_live_…`, run it again, and the same catalogue is created in
+   live mode.
+3. **Deploy the API** — `bunx wrangler deploy`; the script has already set the
+   bindings it needs.
 5. **Frontend** — deploy the static build (`bun run build` → `dist/`). Leave `VITE_API_URL` unset when the app and the API share an origin, which is the Cloudflare Worker case: the client then calls `/auth/*` on its own origin. Set it only when the API lives elsewhere — `.github/workflows/deploy.yml` does that for the Pages build, pointing it at `https://mapmycams.dev`.
 
 **OAuth providers** — see [`docs/oauth-integration.md`](docs/oauth-integration.md) when you want Google/Apple/Microsoft back.
+
+## How a purchase happens
+
+1. **Choose** — the pricing page, the upgrade modal and the add-on rows all call
+   `POST /billing/checkout`. The server maps the plan key to a Stripe price ID and
+   creates a Checkout Session tagged with the account id and the item. Card details
+   are only ever typed on Stripe's own page.
+2. **Pay** — the browser is handed to the session's `url`. `success_url` returns to
+   `/?checkout=success&session_id=…`; `cancel_url` returns to `/?checkout=cancelled`.
+3. **Return** — the app posts that session id to `POST /billing/confirm`, which
+   reads the session back from Stripe, checks it really belongs to the signed-in
+   account and applies the purchase. This is what makes the plan right immediately,
+   instead of whenever the webhook happens to arrive.
+4. **Webhook** — `POST /webhooks/stripe` verifies the `Stripe-Signature` HMAC and
+   applies the same grant, so a purchase still lands when the customer closes the
+   tab before returning. Both paths call the same `grantPurchase()`, so a purchase
+   applied twice is harmless.
+5. **Manage** — cards, invoices and cancellation live in Stripe's billing portal
+   (`POST /billing/portal`). "Cancel subscription" opens the portal rather than
+   flipping the account to Free locally: doing that would cut off access while
+   Stripe carried on charging. `customer.subscription.deleted` is what actually
+   downgrades the account.
+
+Two things that are deliberately *not* possible:
+
+- **A redirect alone never unlocks anything.** `POST /billing/checkout` answers
+  `503` for an item with no price ID on the Worker rather than granting it as a
+  demo, and `grantPurchase()` only ever runs for a session Stripe reports as paid.
+- **One account cannot claim another's session.** `/billing/confirm` compares the
+  session's `client_reference_id` with the signed-in account before granting.
+
+Billing history comes from `POST /billing/invoices`, which asks Stripe for the
+customer's invoices — so the dashboard and the portal show the same record.
+
+### Verifying billing with no Stripe account
+
+```bash
+bun run billing:test
+```
+
+That drives the real handler with Stripe stubbed out: the demo grant, the paid
+redirect (including the metadata a subscription needs), the confirm path — another
+account's session refused, an unpaid session granting nothing — invoice mapping,
+the cancel guard, and the webhook signature both valid and forged.
 
 ### Environment variables
 
@@ -236,12 +299,12 @@ Backend bindings (`wrangler.jsonc`):
 kv_namespaces: MAPMYCAMS_STORE=<namespace id>   # accounts, floorplans, flags
 ```
 
-Backend (worker secrets):
+Backend (worker secrets) — `bun run stripe:setup` sets every Stripe value below:
 ```
 AUTH_SECRET=<random 32+ chars>     # signs sessions AND keys password + code hashes
 RESEND_API_KEY=re_...              # signup verification codes (https://resend.com/api-keys)
 EMAIL_FROM=MapMyCams <noreply@yourdomain.com>   # required: an address at your verified Resend domain
-STRIPE_SECRET_KEY=sk_live_...
+STRIPE_SECRET_KEY=sk_live_...      # sk_test_... while trying it out
 STRIPE_WEBHOOK_SECRET=whsec_...
 PRICE_PREMIUM_MONTHLY=price_...
 PRICE_PREMIUM_YEARLY=price_...

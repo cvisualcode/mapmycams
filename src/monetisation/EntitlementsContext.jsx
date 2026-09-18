@@ -18,6 +18,8 @@ export function EntitlementsProvider({ children }) {
   const [pendingEmail, setPendingEmail] = useState(() => api.pendingVerification()?.email || null)
   const [devCode, setDevCode] = useState(null)
   const [deliveryError, setDeliveryError] = useState(null)
+  // What to tell the user about the trip to Stripe: null | 'success' | 'pending' | 'cancelled' | 'error'
+  const [checkoutNotice, setCheckoutNotice] = useState(null)
 
   // Restore any existing session on load.
   useEffect(() => {
@@ -35,6 +37,32 @@ export function EntitlementsProvider({ children }) {
   }, [user])
 
   useEffect(() => { refreshFloorplans() }, [refreshFloorplans])
+
+  // Coming back from Stripe: /?checkout=success&session_id=… — ask the server to
+  // apply the purchase so the plan is right straight away rather than whenever the
+  // webhook happens to land. Waits for the session restore first, so the two do not
+  // race over which one knows the newer account.
+  useEffect(() => {
+    if (loading || typeof window === 'undefined') return
+    const url = new URL(window.location.href)
+    const result = url.searchParams.get('checkout')
+    if (!result) return
+    const sessionId = url.searchParams.get('session_id')
+    for (const key of ['checkout', 'session_id']) url.searchParams.delete(key)
+    window.history.replaceState({}, '', url.pathname + url.search + url.hash)
+
+    // Nothing to apply it to without a session (an expired one, say) — signing in
+    // later reads the plan off the account anyway.
+    if (!user) return
+    if (result === 'cancelled') { setCheckoutNotice('cancelled'); return }
+    api.confirmCheckout(sessionId)
+      .then(async (res) => {
+        if (res?.user) setUser(res.user)
+        else if (res?.pending) { const me = await api.getMe().catch(() => null); if (me) setUser(me) }
+        setCheckoutNotice(res?.pending ? 'pending' : 'success')
+      })
+      .catch(() => setCheckoutNotice('error'))
+  }, [loading, user])
 
   const limits = limitsFor(user ? user.plan : 'free')
 
@@ -116,12 +144,16 @@ export function EntitlementsProvider({ children }) {
     async logout() { await api.logout(); setUser(null); setFloorplans([]) },
     async startCheckout(item, kind) {
       const res = await api.startCheckout(item, kind)
+      // Paid mode sends the browser to Stripe, so the entitlement arrives on the
+      // way back (see the return handler above) — not from this call.
       if (res && res.demo) {
         const me = await api.getMe()
         setUser(me)
       }
       return res
     },
+    checkoutNotice,
+    dismissCheckoutNotice: () => setCheckoutNotice(null),
     async saveFloorplan(name, data, id) {
       const saved = await api.saveFloorplan(name, data, id)
       await refreshFloorplans()

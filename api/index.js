@@ -5,7 +5,7 @@
 //   POST /auth/send-code  (mailer only — for browsers with no server session)
 //   GET  /me
 //   GET/POST/DELETE /floorplans(/:id)
-//   POST /billing/checkout | /billing/portal | /billing/cancel
+//   POST /billing/checkout | /billing/confirm | /billing/portal | /billing/cancel | /billing/invoices
 //   POST /webhooks/stripe
 //   POST /ai/suggest  (rate-limited, premium only)
 //   POST /analytics
@@ -17,7 +17,8 @@
 import {
   signToken, verifyToken, hashPassword, verifyPassword,
   getUser, listUsers, saveUser, listFloorplans, saveFloorplan, deleteFloorplan, setFlag,
-  stripeCheckoutSession, stripePortalSession, verifyStripeSignature, stripeConfigured,
+  stripeCheckoutSession, stripeGetSession, stripeListInvoices,
+  stripePortalSession, verifyStripeSignature, stripeConfigured,
   generateVerificationCode, hashCode, verifyCode, credentialProblem, sendVerificationEmail,
   emailConfigured, resendCooldownRemaining, CODE_TTL_MS, CODE_MAX_ATTEMPTS,
   json, cors, rateLimit,
@@ -36,6 +37,28 @@ const PRICE_MAP = () => ({
 
 /** The one-off add-ons, used when there are no Stripe prices to read a mode from. */
 const ADDON_ITEMS = ['ai_pack', 'pdf_report', 'family', 'brands']
+
+/** True for a plan key, false for an add-on key. */
+const isAddon = (item) => ADDON_ITEMS.includes(item)
+
+/**
+ * Apply a completed purchase to an account.
+ *
+ * Shared by the webhook and by the confirm call the browser makes on its way
+ * back from Stripe, so a purchase is recorded the same way whichever gets there
+ * first — and applying it twice (both do, normally) is harmless: the plan is
+ * overwritten with the same value and add-ons are a set.
+ */
+async function grantPurchase(account, { item, mode, customerId }) {
+  if (!account || !item) return null
+  const customer = customerId || account.stripe_customer_id
+  if (mode === 'subscription') {
+    if (isAddon(item)) return null
+    return saveUser({ email: account.email, plan: item, stripe_customer_id: customer })
+  }
+  if (!isAddon(item)) return null
+  return saveUser({ email: account.email, addons: [...new Set([...(account.addons || []), item])], stripe_customer_id: customer })
+}
 
 /** The only origins allowed to reach the verification mailer. */
 const MAILER_ORIGIN = /^https?:\/\/([a-z0-9-]+\.)?(mapmycams\.dev|mapmycams\.pages\.dev|localhost(:\d+)?)$/i
@@ -266,19 +289,67 @@ async function handle(request, env) {
     const entry = PRICE_MAP()[item]
     if (!entry) return json({ error: 'Unknown plan or add-on' }, 400)
 
-    // Without Stripe keys there is nothing to charge, so grant the entitlement the
-    // way the browser-only build does. This keeps the pricing flow demonstrable and
-    // switches itself off the moment a real secret key is set.
-    if (!stripeConfigured() || !entry.price) {
-      const patch = ADDON_ITEMS.includes(item)
+    // With no Stripe secret key there is nothing to charge, so the entitlement is
+    // granted here — that keeps the pricing flow demonstrable and switches itself
+    // off the moment a real key is set. Once Stripe *is* configured, an item with
+    // no price ID cannot be sold, and granting it anyway would hand out Premium
+    // for free: that is an error, not a discount.
+    if (!stripeConfigured()) {
+      const patch = isAddon(item)
         ? { email: user.email, addons: [...new Set([...(user.addons || []), item])] }
         : { email: user.email, plan: item }
       const row = await saveUser(patch)
       return json({ demo: true, user: publicRow(row) })
     }
+    if (!entry.price) return json({ error: `Stripe is not set up for ${item} yet`, item }, 503)
 
-    const session = await stripeCheckoutSession({ priceId: entry.price, userId: user.id, email: user.email, mode: entry.mode })
-    return json({ url: session.url })
+    const session = await stripeCheckoutSession({
+      priceId: entry.price, userId: user.id, email: user.email, mode: entry.mode, item,
+    })
+    return json({ url: session.url, id: session.id })
+  }
+  // The browser lands back here with ?session_id=… and asks the server to apply
+  // the purchase, rather than showing a plan that only catches up once the
+  // webhook event has been delivered.
+  if (path === '/billing/confirm' && method === 'POST') {
+    const user = await authUser(request)
+    if (!user) return json({ error: 'Unauthorised' }, 401)
+    const { sessionId } = await request.json().catch(() => ({}))
+    if (!stripeConfigured() || !sessionId) return json({ demo: true })
+
+    let session
+    try {
+      session = await stripeGetSession(sessionId)
+    } catch {
+      return json({ error: 'That checkout session could not be read' }, 404)
+    }
+    // Only the account that started the session may claim it — otherwise a
+    // leaked session id would be a way to buy Premium for someone else's account.
+    if (session.client_reference_id && session.client_reference_id !== user.id) {
+      return json({ error: 'Not your checkout session' }, 403)
+    }
+    const paid = session.payment_status === 'paid' || session.status === 'complete'
+    if (!paid) return json({ pending: true })
+    const row = await grantPurchase(user, { item: session.metadata?.item, mode: session.mode, customerId: session.customer })
+    return json({ ok: true, user: publicRow(row || user) })
+  }
+  // Real invoices, straight from Stripe, so the dashboard's billing history is the
+  // same record the customer sees in the portal.
+  if (path === '/billing/invoices' && method === 'POST') {
+    const user = await authUser(request)
+    if (!user) return json({ error: 'Unauthorised' }, 401)
+    if (!stripeConfigured() || !user.stripe_customer_id) return json({ invoices: [] })
+    const rows = await stripeListInvoices(user.stripe_customer_id).catch(() => [])
+    return json({
+      invoices: rows.map((inv) => ({
+        id: inv.id,
+        item: inv.lines?.data?.[0]?.description || inv.description || 'MapMyCams',
+        kind: inv.subscription ? 'subscription' : 'addon',
+        amount: (inv.amount_paid || 0) / 100,
+        status: inv.status || 'unknown',
+        date: new Date((inv.created || 0) * 1000).toISOString(),
+      })),
+    })
   }
   if (path === '/billing/portal' && method === 'POST') {
     const user = await authUser(request)
@@ -290,7 +361,13 @@ async function handle(request, env) {
   if (path === '/billing/cancel' && method === 'POST') {
     const user = await authUser(request)
     if (!user) return json({ error: 'Unauthorised' }, 401)
-    // Cancellation happens in the Stripe billing portal; here we just flag it.
+    // A subscription bought through Stripe is cancelled at Stripe. Flipping the
+    // account to free here would cut off their access while Stripe carried on
+    // charging the card, so the customer is sent to the portal instead.
+    if (stripeConfigured() && user.stripe_customer_id) {
+      const session = await stripePortalSession(user.stripe_customer_id).catch(() => null)
+      return json({ error: 'Cancel in the billing portal so the payments stop too', url: session?.url || null }, 409)
+    }
     const row = await saveUser({ email: user.email, plan: 'free' })
     return json({ ok: true, plan: row.plan, user: publicRow(row) })
   }
@@ -304,14 +381,7 @@ async function handle(request, env) {
     if (event.type === 'checkout.session.completed') {
       const s = event.data.object
       const account = await findAccount(s.client_reference_id || s.metadata?.userId)
-      if (account) {
-        if (s.mode === 'subscription') {
-          await saveUser({ email: account.email, plan: s.metadata?.plan || 'premium_monthly', stripe_customer_id: s.customer })
-        } else {
-          const addons = new Set([...(account.addons || []), s.metadata?.addon].filter(Boolean))
-          await saveUser({ email: account.email, addons: [...addons], stripe_customer_id: s.customer })
-        }
-      }
+      await grantPurchase(account, { item: s.metadata?.item, mode: s.mode, customerId: s.customer })
     }
     if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.paused') {
       const account = await findAccount(event.data.object.metadata?.userId)

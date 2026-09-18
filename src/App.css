@@ -551,6 +551,13 @@
 .dash-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; padding: 24px; max-width: 1200px; margin: 0 auto; }
 .dash-card { background: #fff; border-radius: 14px; padding: 20px; box-shadow: 0 1px 4px rgba(2,6,23,.06); }
 .dash-card h3 { margin: 0 0 10px; font-size: 16px; }
+/* Result of a trip to Stripe, shown across the top of the dashboard. */
+.checkout-notice { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-radius: 12px; font-size: 14px; background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+.checkout-notice.pending { background: #fffbeb; color: #92400e; border-color: #fde68a; }
+.checkout-notice.cancelled { background: #f8fafc; color: #475569; border-color: #e2e8f0; }
+.checkout-notice.error { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
+.checkout-notice-close { border: 0; background: transparent; color: inherit; font-size: 14px; cursor: pointer; opacity: .7; }
+.checkout-notice-close:hover { opacity: 1; }
 .fp-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
 .fp-row { display: flex; align-items: center; gap: 10px; font-size: 13px; padding: 8px 10px; background: #f8fafc; border-radius: 8px; flex-wrap: wrap; }
 .fp-row .fp-name { font-weight: 600; flex: 1; }

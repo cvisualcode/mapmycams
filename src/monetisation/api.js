@@ -814,17 +814,45 @@ export async function getMe() {
 
 // ─── Billing ─────────────────────────────────────────────────────────────────
 
-/** The signed-in user's invoice history. */
-export function getBilling() {
+/**
+ * The signed-in user's invoice history. Real invoices come from Stripe when the
+ * account has a customer there; otherwise the local demo store answers.
+ */
+export async function getBilling() {
   const user = sessionUser()
   if (!user) return []
+  try {
+    const res = await api('/billing/invoices', {})
+    if (Array.isArray(res?.invoices)) return res.invoices
+  } catch (e) { if (e.message !== 'demo') throw e }
   return loadDB().billing[user.id] || []
+}
+
+/**
+ * Hand the browser to Stripe's own page (checkout or the billing portal) and
+ * prepare for it to come back. Returns true when a navigation was started, so
+ * callers know the entitlement has not been granted yet.
+ */
+function goToStripe(url) {
+  if (!url || typeof window === 'undefined') return false
+  window.location.assign(url)
+  return true
 }
 
 /** Start a Stripe checkout (subscription plan or one-time add-on). */
 export async function startCheckout(itemKey, kind = 'plan') {
   track('checkout_started', { item: itemKey, kind })
-  try { return await api('/billing/checkout', { item: itemKey, kind }) } catch (e) { if (e.message !== 'demo') throw e }
+  let res = null
+  try { res = await api('/billing/checkout', { item: itemKey, kind }) } catch (e) { if (e.message !== 'demo') throw e }
+
+  // Real mode: the server created a Stripe Checkout Session. Card details are
+  // only ever entered on Stripe's page, and nothing is unlocked until the
+  // payment completes and the app confirms it on the way back.
+  if (res?.url) {
+    track('checkout_redirected', { item: itemKey, kind })
+    return { redirecting: goToStripe(res.url), url: res.url }
+  }
+
   // Demo mode: instantly grant the entitlement so the flow is testable
   const user = sessionUser()
   if (!user) throw new Error('Sign in first')
@@ -844,8 +872,24 @@ export async function startCheckout(itemKey, kind = 'plan') {
   return { demo: true }
 }
 
+/**
+ * Apply a purchase on returning from Stripe. The webhook does this too, but it is
+ * asynchronous, so asking about the session we were handed makes the new plan
+ * visible immediately instead of a minute later.
+ * Returns `{ user }` once applied, `{ pending: true }` while Stripe still calls it
+ * unpaid, and `{ demo: true }` when there is no Stripe behind the app.
+ */
+export async function confirmCheckout(sessionId) {
+  try { return await api('/billing/confirm', { sessionId }) } catch (e) { if (e.message !== 'demo') throw e }
+  return { demo: true }
+}
+
 export async function openBillingPortal() {
-  try { return await api('/billing/portal', {}) } catch (e) { if (e.message !== 'demo') throw e }
+  try {
+    const res = await api('/billing/portal', {})
+    if (res?.url) { goToStripe(res.url); return { redirecting: true } }
+    return res
+  } catch (e) { if (e.message !== 'demo') throw e }
   track('billing_portal_demo', {})
   return { demo: true }
 }

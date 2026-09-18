@@ -241,7 +241,7 @@ export function UpgradeModal() {
           {monthly.features.slice(0, 5).map((f) => <li key={f}>{f}</li>)}
         </ul>
         <div className="upgrade-price">{formatPrice(monthly.price)}<span>/{monthly.period}</span></div>
-        <button className="btn-primary" onClick={() => ent.startCheckout('premium_monthly', 'plan')}>Upgrade now</button>
+        <button className="btn-primary" onClick={() => ent.startCheckout('premium_monthly', 'plan').then(ent.closeUpgrade)}>Upgrade now</button>
         <button className="btn-ghost" onClick={ent.closeUpgrade}>Maybe later</button>
       </div>
     </div>
@@ -255,10 +255,10 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing }) {
   const [billing, setBilling] = useState([])
   const [twoFA, setTwoFA] = useState(false)
 
-  useState(() => {
-    setBilling(api.getBilling())
+  useEffect(() => {
+    api.getBilling().then(setBilling).catch(() => setBilling([]))
     if (ent.user?.twoFA) setTwoFA(true)
-  })
+  }, [ent.user?.plan, ent.user?.addons?.length])
 
   const planLabel = ent.user?.isAdmin ? 'Admin (full access)' : ent.isPremium ? 'Premium — ' + ent.user.plan.replace('premium_', '') : 'Free'
 
@@ -275,6 +275,17 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing }) {
       </header>
 
       <div className="dash-grid">
+        {ent.checkoutNotice && (
+          <div className={`checkout-notice ${ent.checkoutNotice}`}>
+            <span>
+              {ent.checkoutNotice === 'success' && '✓ Payment received — your plan is unlocked.'}
+              {ent.checkoutNotice === 'pending' && 'Payment received. Stripe is still confirming it, so your plan will update in a moment.'}
+              {ent.checkoutNotice === 'cancelled' && 'Checkout cancelled — nothing was charged.'}
+              {ent.checkoutNotice === 'error' && 'We could not confirm that checkout. If you were charged, refresh in a moment or open the billing portal.'}
+            </span>
+            <button className="checkout-notice-close" onClick={ent.dismissCheckoutNotice}>✕</button>
+          </div>
+        )}
         <section className="dash-card">
           <h3>Your floorplans</h3>
           <p className="spec-hint">{ent.limits.floorplans === Infinity ? 'Unlimited' : `${ent.floorplans.length} of ${ent.limits.floorplans} saved (Free tier)`}</p>
@@ -299,7 +310,14 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing }) {
             <>
               <p className="spec-hint">Manage payment methods, invoices and cancellation in the billing portal.</p>
               <button className="btn-primary" onClick={() => api.openBillingPortal()}>Open billing portal</button>
-              <button className="btn-ghost" onClick={async () => { const u = await api.cancelSubscription(); ent.user && window.location.reload(); return u }}>Cancel subscription</button>
+              <button className="btn-ghost" onClick={async () => {
+                // A real subscription is cancelled at Stripe: the portal is the only
+                // place that stops the payments as well as the access.
+                const portal = await api.openBillingPortal()
+                if (portal?.redirecting) return
+                await api.cancelSubscription()
+                window.location.reload()
+              }}>Cancel subscription</button>
             </>
           ) : (
             <>
@@ -361,10 +379,7 @@ export function PricingPage({ onBack }) {
             <ul>{p.features.map((f) => <li key={f}>{f}</li>)}</ul>
             <button
               className="btn-primary"
-              onClick={() => {
-                if (p.key === 'free') return
-                ent.startCheckout(p.key, 'plan').then(() => window.location.reload())
-              }}
+              onClick={() => ent.startCheckout(p.key, 'plan')}
             >
               {p.price === 0 ? 'Current (Free)' : `Choose ${p.name}`}
             </button>
@@ -378,7 +393,7 @@ export function PricingPage({ onBack }) {
             <h2>{a.name}</h2>
             <div className="price-big">{formatPrice(a.price)}<span> once</span></div>
             <p className="spec-hint">{a.blurb}</p>
-            <button className="btn-primary" onClick={() => ent.startCheckout(a.key, 'addon').then(() => window.location.reload())}>Buy add-on</button>
+            <button className="btn-primary" onClick={() => ent.startCheckout(a.key, 'addon')}>Buy add-on</button>
           </div>
         ))}
       </div>

@@ -8,7 +8,9 @@
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "email:test": "node scripts/test-email.mjs"
+    "email:test": "node scripts/test-email.mjs",
+    "stripe:setup": "node scripts/stripe-setup.mjs",
+    "billing:test": "node scripts/test-billing.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",
