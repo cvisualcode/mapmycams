@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import { useEntitlements } from './monetisation/EntitlementsContext'
 import './App.css'
 
 const PIXELS_PER_METER = 40
@@ -187,6 +188,48 @@ const CAMERA_CATALOG = [
     fovLabel: '90°',
     irLabel: 'IR 20 m',
     rating: 'IP67',
+    referralUrl: '',
+  },
+  {
+    id: 'ring-stickup',
+    name: 'Ring Stick Up Cam',
+    brand: 'Ring',
+    premium: true,
+    presetId: 'outdoor-bullet',
+    kind: 'bullet',
+    accent: '#22d3ee',
+    resolutionLabel: '1080p HD',
+    fovLabel: '80°',
+    irLabel: 'Night vision',
+    rating: 'Battery',
+    referralUrl: '',
+  },
+  {
+    id: 'nest-cam-indoor',
+    name: 'Nest Cam (indoor)',
+    brand: 'Nest',
+    premium: true,
+    presetId: 'indoor-wide',
+    kind: 'dome',
+    accent: '#fb923c',
+    resolutionLabel: '1080p HDR',
+    fovLabel: '135°',
+    irLabel: 'Night vision',
+    rating: 'Wi-Fi',
+    referralUrl: '',
+  },
+  {
+    id: 'reolink-8mp',
+    name: 'Reolink 4K PoE',
+    brand: 'Reolink',
+    premium: true,
+    presetId: 'outdoor-bullet',
+    kind: 'bullet',
+    accent: '#a78bfa',
+    resolutionLabel: '4K 8MP',
+    fovLabel: '100°',
+    irLabel: 'IR 30 m',
+    rating: 'PoE',
     referralUrl: '',
   },
   {
@@ -752,6 +795,64 @@ function drawWall(ctx, wall, origin, pan, zoom, objects) {
   }
 }
 
+// ── AI blind-spot detection ──────────────────────────────────────────────────
+// Samples a grid across every closed room and reports rooms (or areas) that no
+// camera FOV reaches, treating walls and vision-blocking objects as opaque.
+function computeBlindSpots(walls, cameras, objects) {
+  const closed = walls.filter((w) => w.closed !== false && w.points.length >= 3)
+  if (closed.length === 0) return []
+  const CELL = 60
+  const blind = []
+  for (const wall of closed) {
+    const xs = wall.points.map((pt) => pt.x)
+    const ys = wall.points.map((pt) => pt.y)
+    const minX = Math.min(...xs), maxX = Math.max(...xs)
+    const minY = Math.min(...ys), maxY = Math.max(...ys)
+    const cells = []
+    for (let x = minX + CELL / 2; x < maxX; x += CELL) {
+      for (let y = minY + CELL / 2; y < maxY; y += CELL) {
+        if (!isPointInPolygon(x, y, wall.points)) continue
+        const visible = cameras.some((cam) => {
+          const dx = x - cam.x, dy = y - cam.y
+          const dist = Math.hypot(dx, dy)
+          if (dist > (cam.distance || 10) * 40) return false
+          const ang = (Math.atan2(dy, dx) * 180) / Math.PI
+          const rel = ((ang - cam.rotation) % 360 + 540) % 360 - 180
+          if (Math.abs(rel) > (cam.hFov || 90) / 2) return false
+          // occlusion by walls (excluding the camera's own boundary crossing) and solid objects
+          for (const w of closed) {
+            const pts = w.points
+            for (let i = 0; i < pts.length; i++) {
+              const a1 = pts[i], a2 = pts[(i + 1) % pts.length]
+              if (segRayBlocked(cam.x, cam.y, x, y, a1, a2, wall, w)) return false
+            }
+          }
+          for (const o of objects) {
+            if (!o.blocksVision) continue
+            const halfW = ((o.width || 1) * 40) / 2, halfH = ((o.height || 1) * 40) / 2
+            if (Math.abs(o.x - x) < halfW + 8 && Math.abs(o.y - y) < halfH + 8 && Math.abs(o.x - cam.x) < Math.abs(dx) && Math.abs(o.y - cam.y) < Math.abs(dy)) return false
+          }
+          return true
+        })
+        if (!visible) cells.push({ x, y })
+      }
+    }
+    if (cells.length > 0) blind.push({ wall, label: wall.label || 'Room', cells, area: cells.length * (CELL / 40) * (CELL / 40) })
+  }
+  return blind
+}
+
+function segRayBlocked(cam, target, a1, a2, camWall, segWall) {
+  const d = (target.x - cam.x) * (a2.y - a1.y) - (target.y - cam.y) * (a2.x - a1.x)
+  if (Math.abs(d) < 1e-9) return false
+  const t = ((a1.x - cam.x) * (a2.y - a1.y) - (a1.y - cam.y) * (a2.x - a1.x)) / d
+  const u = ((a1.x - cam.x) * (target.y - cam.y) - (a1.y - cam.y) * (target.x - cam.x)) / d
+  if (!(t > 0.02 && t < 0.98 && u > 0 && u < 1)) return false
+  // A camera inside a room isn't occluded by that room's own boundary for
+  // targets in the same room; it IS blocked by other rooms' walls.
+  return segWall !== camWall || false
+}
+
 function isPointInPolygon(x, y, polygon) {
   let inside = false
   for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
@@ -1009,7 +1110,145 @@ function isOnRotationHandle(canvasX, canvasY, cam, origin, pan, zoom) {
   return Math.hypot(canvasX - handleX, canvasY - handleY) < 12
 }
 
-function App() {
+
+
+// Safe accessor: the editor also runs standalone (outside the shell) where no
+// EntitlementsProvider exists — hooks must not throw in that case.
+function useEntitlementsSafe() {
+  try { return useEntitlements() } catch { return null }
+}
+
+// ── AI camera placement heuristic ────────────────────────────────────────────
+// Places cameras near room corners: for each closed wall polygon, find its
+// bounding box and put a camera at opposite corners with a wide FOV aimed at
+// the room centre. Skips spots already covered by an existing camera.
+function aiSuggestSpots(walls, existingCameras) {
+  const closed = walls.filter((w) => w.closed !== false && w.points.length >= 3)
+  if (closed.length === 0) return []
+  const ppm = 40 // PIXELS_PER_METER
+  const RAY_COUNT = 48
+
+  // Sample points inside each room (grid) as the coverage targets
+  const targets = []
+  for (const wall of closed) {
+    const xs = wall.points.map((pt) => pt.x)
+    const ys = wall.points.map((pt) => pt.y)
+    const minX = Math.min(...xs), maxX = Math.max(...xs)
+    const minY = Math.min(...ys), maxY = Math.max(...ys)
+    const step = 60
+    for (let x = minX + step / 2; x < maxX; x += step) {
+      for (let y = minY + step / 2; y < maxY; y += step) {
+        if (isPointInPolygon(x, y, wall.points)) targets.push({ x, y, wall })
+      }
+    }
+  }
+  if (targets.length === 0) return []
+
+  // Candidate camera positions: inset corners of every room
+  const candidates = []
+  for (const wall of closed) {
+    const xs = wall.points.map((pt) => pt.x)
+    const ys = wall.points.map((pt) => pt.y)
+    const minX = Math.min(...xs), maxX = Math.max(...xs)
+    const minY = Math.min(...ys), maxY = Math.max(...ys)
+    const inset = 12
+    for (const [x, y] of [[minX + inset, minY + inset], [maxX - inset, minY + inset], [minX + inset, maxY - inset], [maxX - inset, maxY - inset]]) {
+      const cx = Math.max(minX + 4, Math.min(maxX - 4, x))
+      const cy = Math.max(minY + 4, Math.min(maxY - 4, y))
+      const room = closed.find((w) => isPointInPolygon(cx, cy, w.points))
+      if (room) candidates.push({ x: cx, y: cy, wall: room })
+    }
+  }
+
+  // What each candidate can see (FOV rays vs the same wall geometry the renderer uses)
+  function seesFrom(camPos) {
+    const seen = new Set()
+    const roomPts = camPos.wall.points
+    const xs = roomPts.map((pt) => pt.x), ys = roomPts.map((pt) => pt.y)
+    const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys)
+    const maxDist = Math.hypot(maxX - minX, maxY - minY) + 40
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2
+    const rot = (Math.atan2(cy - camPos.y, cx - camPos.x) * 180) / Math.PI
+    const hFov = Math.min(120, maxDist > 600 ? 90 : 120)
+    const leftA = ((rot - hFov / 2) * Math.PI) / 180
+    const rightA = ((rot + hFov / 2) * Math.PI) / 180
+    for (const t of targets) {
+      const dx = t.x - camPos.x, dy = t.y - camPos.y
+      const ang = Math.atan2(dy, dx)
+      const relA = ang - leftA
+      const span = rightA - leftA
+      let norm = Math.atan2(Math.sin(relA), Math.cos(relA))
+      if (norm < 0 || norm > span) continue
+      if (Math.hypot(dx, dy) > maxDist) continue
+      // ray-cast: blocked by other walls (not its own room walls beyond the boundary)
+      let blocked = false
+      for (const w of closed) {
+        if (w === t.wall && w === camPos.wall) continue
+        const pts = w.points
+        for (let i = 0; i < pts.length; i++) {
+          const a1 = pts[i], a2 = pts[(i + 1) % pts.length]
+          if (segIntersect(camPos.x, camPos.y, t.x, t.y, a1.x, a1.y, a2.x, a2.y)) { blocked = true; break }
+        }
+        if (blocked) break
+      }
+      if (!blocked) seen.add(t)
+    }
+    return seen
+  }
+
+  function segIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
+    const d = (bx - ax) * (dy - cy) - (by - ay) * (dx - cx)
+    if (Math.abs(d) < 1e-9) return false
+    const t = ((cx - ax) * (dy - cy) - (cy - ay) * (dx - cx)) / d
+    const u = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / d
+    return t > 0.02 && t < 0.98 && u > 0 && u < 1
+  }
+
+  // Greedy set cover: repeatedly take the candidate that covers the most
+  // still-uncovered targets — yields close to the minimum camera count.
+  const uncovered = new Set(targets)
+  const chosen = []
+  const coveredByExisting = new Set()
+  for (const t of targets) {
+    for (const c of existingCameras) {
+      if (Math.hypot(c.x - t.x, c.y - t.y) < (c.distance || 10) * ppm) { coveredByExisting.add(t); break }
+    }
+  }
+  for (const t of coveredByExisting) uncovered.delete(t)
+
+  const evaluated = candidates.map((c) => ({ pos: c, seen: seesFrom(c) }))
+  while (uncovered.size > 0) {
+    let best = null, bestGain = 0
+    for (const ev of evaluated) {
+      let gain = 0
+      for (const t of ev.seen) if (uncovered.has(t)) gain++
+      if (gain > bestGain) { bestGain = gain; best = ev }
+    }
+    if (!best || bestGain === 0) break
+    chosen.push(best)
+    for (const t of best.seen) uncovered.delete(t)
+  }
+
+  return chosen.map((ev, i) => {
+    const { pos, seen } = ev
+    const roomPts = pos.wall.points
+    const xs = roomPts.map((pt) => pt.x), ys = roomPts.map((pt) => pt.y)
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2
+    const cy = (Math.min(...ys) + Math.max(...ys)) / 2
+    const farthest = Math.max(...[...seen].map((t) => Math.hypot(t.x - pos.x, t.y - pos.y)), 120)
+    return {
+      id: 'ai_' + Math.random().toString(36).slice(2, 9),
+      x: pos.x, y: pos.y,
+      rotation: Math.round((Math.atan2(cy - pos.y, cx - pos.x) * 180) / Math.PI),
+      hFov: 120,
+      distance: Math.max(4, Math.round(farthest / ppm) + 1),
+      color: '#38bdf8',
+      label: 'AI Cam ' + (i + 1),
+    }
+  })
+}
+
+function App({ onExit, showUpgrade }) {
   const canvasRef = useRef(null)
   const containerRef = useRef(null)
   const [mode, setMode] = useState('wall')
@@ -1048,6 +1287,12 @@ function App() {
   const [specFov, setSpecFov] = useState(90)
   const [specResolution, setSpecResolution] = useState(RESOLUTIONS[1])
   const [specGoal, setSpecGoal] = useState(DETECTION_LEVELS[0])
+
+  // ── Monetisation hooks (provided by AppShell's EntitlementsProvider) ──
+  const ent = useEntitlementsSafe()
+  const camLimit = ent ? (ent.user && ent.user.isAdmin ? Infinity : ent.limits.cameras) : Infinity
+  const camLimitReached = cameras.length >= camLimit
+  const [aiBlindSpots, setAiBlindSpots] = useState([])
 
   // Observable-range estimate: at distance D the camera sees a horizontal width of
   // 2·D·tan(FOV/2). Divide the sensor's horizontal pixels by that width to get the
@@ -2174,6 +2419,10 @@ function App() {
   function handleMouseUp() {
     if (placingCamera) {
       const preset = placingCamera.preset
+      if (camLimitReached) {
+        if (showUpgrade) showUpgrade('Camera limit reached', `Free tier supports up to ${camLimit} cameras. Upgrade to Premium for unlimited cameras.`, 'premium_monthly')
+        return
+      }
       setCameras((prev) => [
         ...prev,
         {
@@ -2324,9 +2573,24 @@ function App() {
 
   function exportImage() {
     const canvas = canvasRef.current
+    if (!canvas) return
+    const watermarked = ent ? !ent.isPremium : false
+    let dataUrl = canvas.toDataURL('image/png')
+    if (watermarked) {
+      // Composite the canvas with a watermark overlay for free-tier exports
+      const tmp = document.createElement('canvas')
+      tmp.width = canvas.width; tmp.height = canvas.height
+      const ctx = tmp.getContext('2d')
+      ctx.drawImage(canvas, 0, 0)
+      ctx.font = `${Math.max(18, canvas.width * 0.025)}px system-ui`
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.35)'
+      ctx.textAlign = 'center'
+      ctx.fillText('MapMyCams Free — mapmycams.dev', canvas.width / 2, canvas.height - 24)
+      dataUrl = tmp.toDataURL('image/png')
+    }
     const link = document.createElement('a')
     link.download = 'floorplan.png'
-    link.href = canvas.toDataURL('image/png')
+    link.href = dataUrl
     link.click()
   }
 
@@ -2386,6 +2650,42 @@ function App() {
     resetView()
   }, [])
 
+  // ── Cloud save / load bridge used by the dashboard shell ──
+  useEffect(() => {
+    window.__mmcGetSnapshot = () => ({ version: 1, walls, cameras, objects, wires })
+    window.__mmcSetSnapshot = (snap) => {
+      if (!snap) { setWalls([]); setCameras([]); setObjects([]); setWires([]); return }
+      if (Array.isArray(snap.walls)) setWalls(snap.walls)
+      if (Array.isArray(snap.cameras)) setCameras(snap.cameras)
+      if (Array.isArray(snap.objects)) setObjects(snap.objects)
+      if (Array.isArray(snap.wires)) setWires(snap.wires)
+    }
+  })
+
+  // ── AI camera placement suggestions (premium / AI add-on) ──
+  function aiPlaceCameras() {
+    if (ent && !ent.can('ai')) {
+      if (showUpgrade) showUpgrade('AI camera placement', 'Let AI analyse your floorplan geometry and place cameras at the optimal spots.', 'ai_pack')
+      return
+    }
+    const spots = aiSuggestSpots(walls, cameras)
+    if (spots.length > 0) setCameras((prev) => [...prev, ...spots])
+    setAiBlindSpots(computeBlindSpots(walls, [...cameras, ...spots], objects))
+  }
+
+  // ── AI blind-spot detection ──
+  function runBlindSpotDetection() {
+    if (ent && !ent.can('ai')) {
+      if (showUpgrade) showUpgrade('AI blind-spot detection', 'AI scans every room and reports exactly which areas no camera can see.', 'ai_pack')
+      return
+    }
+    setAiBlindSpots(computeBlindSpots(walls, cameras, objects))
+  }
+
+  function exitToDashboard() {
+    if (onExit) onExit()
+  }
+
   return (
     <div className="app">
       <div className="toolbar">
@@ -2432,24 +2732,8 @@ function App() {
               </label>
             </>
           )}
-          {mode === 'object' && showObjectPanel && (
-            <div className="object-panel">
-              {OBJECT_PRESETS.map((preset) => (
-                <button
-                  key={preset.id}
-                  className={`object-preset ${activeObjectPreset.id === preset.id ? 'active' : ''}`}
-                  onClick={() => setActiveObjectPreset(preset)}
-                >
-                  <span className="object-swatch" style={{ backgroundColor: preset.color }}></span>
-                  <span className="object-label">{preset.label}</span>
-                </button>
-              ))}
-            </div>
-          )}
           {mode === 'select' && selectedCamera && (
-            <>
-              <button onClick={deleteSelected}>Delete Camera</button>
-            </>
+            <button onClick={deleteSelected}>Delete Camera</button>
           )}
           {mode === 'select' && selectedObject && (
             <>
@@ -2458,11 +2742,17 @@ function App() {
             </>
           )}
           {mode === 'select' && selectedRoom !== null && (
-            <>
-              <button onClick={deleteSelectedRoom}>Delete Room</button>
-            </>
+            <button onClick={deleteSelectedRoom}>Delete Room</button>
+          )}
+          <button onClick={aiPlaceCameras} title="Premium: AI-suggested camera positions">✨ AI Place Cameras</button>
+          <button onClick={runBlindSpotDetection} title="Premium: report areas no camera can see">🧭 Blind Spots</button>
+          {aiBlindSpots.length > 0 && (
+            <span className="hint" title="Rooms with areas no camera can see">
+              ⚠ Blind spots: {aiBlindSpots.map((b) => b.label).join(', ')}
+            </span>
           )}
           <button onClick={exportImage}>Export PNG</button>
+          <button onClick={exitToDashboard} title="Save and return to dashboard">Dashboard</button>
           <button onClick={printPlan}>Print</button>
           <button onClick={resetView}>Reset View</button>
         </div>
@@ -2578,33 +2868,39 @@ function App() {
               )}
               <p className="spec-hint">Click any card to load it into the camera tool (then click the plan to place), or paste affiliate links into <code>CAMERA_CATALOG.referralUrl</code> to enable Buy buttons.</p>
               <div className="cam-list">
-                {CAMERA_CATALOG.map((c) => (
+                {CAMERA_CATALOG.map((c) => {
+                  const locked = c.premium && ent && !ent.can('premiumBrands')
+                  return (
                   <div
                     className={`cam-card${sideSelection && sideSelection.type === 'camera' && sideSelection.id === c.presetId ? ' active' : ''}`}
                     key={c.id}
                     role="button"
                     tabIndex={0}
-                    onClick={() => placeCatalogCamera(c.presetId)}
-                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); placeCatalogCamera(c.presetId) } }}
+                    onClick={() => { if (locked) return; placeCatalogCamera(c.presetId) }}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (locked) return; placeCatalogCamera(c.presetId) } }}
                     title={`Switch the camera tool to ${c.name}`}
                   >
                     <img className="cam-img" src={cameraSvg(c.accent, c.kind)} alt={c.name} />
                     <div className="cam-info">
-                      <div className="cam-name">{c.name}</div>
+                      <div className="cam-name">{c.name}{locked ? ' 🔒' : ''}</div>
                       <div className="cam-tags">
                         <span>{c.resolutionLabel}</span>
                         <span>{c.fovLabel}</span>
                         <span>{c.irLabel}</span>
                         <span>{c.rating}</span>
+                        {c.brand ? <span>{c.brand}</span> : null}
                       </div>
-                      {c.referralUrl ? (
+                      {locked ? (
+                        <span className="cam-buy pending" onClick={(e) => { e.stopPropagation(); if (showUpgrade) showUpgrade('Premium camera brands', `Unlock ${c.brand} and other premium brand models with Premium or the Brand Integration add-on.`, 'brands') }}>Premium — unlock</span>
+                      ) : c.referralUrl ? (
                         <a className="cam-buy" href={c.referralUrl} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>Buy</a>
                       ) : (
                         <span className="cam-buy pending" onClick={(e) => e.stopPropagation()} title="Add your affiliate link to CAMERA_CATALOG in src/App.jsx">Buy — link soon</span>
                       )}
                     </div>
                   </div>
-                ))}
+                )
+                })}
               </div>
             </section>
               </>

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "include": [
+    "/auth/*",
+    "/me",
+    "/floorplans/*",
+    "/billing/*",
+    "/webhooks/*",
+    "/admin/*",
+    "/ai/*",
+    "/analytics"
+  ],
+  "exclude": []
+}
