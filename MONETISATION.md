@@ -15,11 +15,47 @@ src/monetisation/
   snapshotBridge.js         ← editor ⇄ shell save/load bridge
 src/App.jsx                 ← the floorplan editor (gated: camera limit, watermark, AI button)
 api/
-  _lib.js                   ← JWT, PBKDF2, Supabase REST, Stripe REST helpers
+  _lib.js                   ← JWT, credentials, Cloudflare KV store, Resend + Stripe
   index.js                  ← all API endpoints
-  schema.sql                ← Postgres schema + RLS + admin seed
-  supabase_auth.sql         ← profiles table + RLS + new-user trigger (run first)
+  schema.sql                ← Postgres alternative — not used (see “Where accounts live”)
+  supabase_auth.sql         ← profiles table + RLS + trigger, for the Supabase OAuth path
 ```
+
+## Where accounts live (Cloudflare KV)
+
+Accounts, sessions, floorplans and feature flags live in a **Cloudflare KV
+namespace** bound as `MAPMYCAMS_STORE`. One key per record, so signing in is a
+single read and there is no database to provision or migrate.
+
+| Key | Holds |
+|---|---|
+| `user:<email>` | the account: id, name, `password_hash`, plan, add-ons, admin flag, pending verification code hash |
+| `plan:<ownerId>:<planId>` | one floorplan |
+| `flag:<name>` | a feature flag |
+
+`api/_lib.js` is the only module that touches the store and `api/index.js` the
+only caller, so that layout is the entire contract — swapping the storage means
+editing one file.
+
+**Two things worth knowing:**
+
+- **KV is eventually consistent.** A write is immediately visible in the colo
+  that served it and elsewhere within about 60 seconds. Sign-up, sign-in and
+  verification all happen in one browser session against one colo, so those flows
+  are unaffected; the case you can actually notice is a floorplan saved here
+  showing up on a *different* device up to a minute later. The client softens it
+  by keeping a local copy of every plan it saves and merging local + server lists
+  on read, so a layout never disappears from the dashboard that drew it.
+- **It is the cheapest thing that works with the deploy token in use.** Cloudflare
+  D1 (SQLite, transactions, immediate consistency) is the better store and needs
+  only the D1 permission added to the API token: `bunx wrangler d1 create
+  mapmycams`, add `d1_databases` to `wrangler.jsonc`, and replace the store
+  helpers in `api/_lib.js`. Nothing outside that file would change.
+
+**Making an account an admin.** There is no admin sign-up path; the seeded
+`Admin` / `Admin1` account is local to its browser. To promote a server account,
+edit its row (Cloudflare → Workers & Pages → KV → `MAPMYCAMS_STORE`) and set
+`"is_admin": true`, then refresh.
 
 ## Plans
 
@@ -40,9 +76,17 @@ bun install
 bun run dev
 ```
 
-With no backend configured the app runs in **demo mode**: accounts, subscriptions, floorplan storage and analytics are persisted to `localStorage`. Everything is clickable and testable — checkout instantly grants the entitlement.
+Out of the box — the sandbox preview, or any static host with no API behind it —
+the app runs in **demo mode**: accounts, sessions, subscriptions, floorplan
+storage and analytics are persisted to `localStorage`, and checkout instantly
+grants the entitlement so the product stays fully clickable.
 
-Demo mode still hashes passwords properly: **PBKDF2-SHA256, 210,000 iterations, a fresh 16-byte random salt per account**, stored as `pbkdf2$sha256$210000$<salt>$<hash>`. Raw passwords are never written anywhere. Sessions are random 32-byte tokens with a 30-day expiry, not bare user ids. Repeated failed sign-ins lock an account for 15 minutes. Accounts created by older builds (DJB2 hashes, id-keyed records) are repaired and re-hashed automatically on the next successful sign-in — see *Security & GDPR* below.
+Deployed on Cloudflare the accounts move to the server (see *Where accounts live*),
+which is what makes one account work on every device. The browser store stays as
+the fallback: an account created locally still signs in, and a plan is written
+locally as well as server-side.
+
+Local mode still hashes passwords properly: **PBKDF2-SHA256, 210,000 iterations, a fresh 16-byte random salt per account**, stored as `pbkdf2$sha256$210000$<salt>$<hash>`. Raw passwords are never written anywhere. Sessions are random 32-byte tokens with a 30-day expiry, not bare user ids. Repeated failed sign-ins lock an account for 15 minutes. Accounts created by older builds (DJB2 hashes, id-keyed records) are repaired and re-hashed automatically on the next successful sign-in — see *Security & GDPR* below.
 
 ## Getting real emails working
 
@@ -164,20 +208,18 @@ place, in both `api/index.js` and `functions/auth/send-code.js`:
   domain. The Custom Domain is unaffected — it is not a wrangler-managed route,
   which is why deploys report `No targets deployed` yet still serve the site.
 
-Neither guard replaces generating the code **server-side**, which is the real
-fix: with no database there is nothing server-side for a code to belong to, so
-the route stays a (now narrow) way to send a fixed 6-digit message.
-
-Once Supabase is connected, `/auth/signup` generates and sends the code itself
-and never returns it to the client; the mailer route is then unused.
+This route exists only for browsers with **no server session** — accounts created
+before the API existed, and the sandbox preview. Accounts created through the API
+never use it: `/auth/signup` generates the code itself, stores only its keyed
+hash, and never returns it to the client.
 
 ## Production setup
 
-1. **Database** — create a Supabase project, paste `api/schema.sql` into the SQL editor. It includes the `alter table` migration for existing databases, and grandfathers accounts created before email verification.
+1. **Account storage** — one Cloudflare KV namespace, already bound in `wrangler.jsonc` as `MAPMYCAMS_STORE` (`bunx wrangler kv namespace create MAPMYCAMS_STORE`, then paste the id into the config). Nothing to provision by hand; `api/schema.sql` is the Postgres/Supabase alternative and is *not* used by this build.
 2. **Stripe** — create products/prices (Premium Monthly, Premium Yearly, and the four one-time add-ons). Copy the price IDs.
 3. **Webhook** — add a Stripe webhook endpoint at `<your-domain>/webhooks/stripe` for `checkout.session.completed`, `customer.subscription.deleted`. Copy the signing secret.
 4. **Deploy the API** — the `api/` folder is a Cloudflare Worker module (`wrangler deploy`) or can be adapted to any Node serverless platform.
-5. **Frontend** — deploy the static build (`bun run build` → `dist/`) and set `VITE_API_URL` to your API base URL.
+5. **Frontend** — deploy the static build (`bun run build` → `dist/`). Leave `VITE_API_URL` unset when the app and the API share an origin, which is the Cloudflare Worker case: the client then calls `/auth/*` on its own origin. Set it only when the API lives elsewhere — `.github/workflows/deploy.yml` does that for the Pages build, pointing it at `https://mapmycams.dev`.
 
 **OAuth providers** — see [`docs/oauth-integration.md`](docs/oauth-integration.md) when you want Google/Apple/Microsoft back.
 
@@ -185,15 +227,18 @@ and never returns it to the client; the mailer route is then unused.
 
 Frontend (build-time):
 ```
-VITE_API_URL=https://api.mapmycams.dev
-VITE_MAILER_URL=https://api.mapmycams.dev/auth/send-code   # optional; defaults to same-origin /auth/send-code
+VITE_API_URL=https://mapmycams.dev   # optional; unset means "this origin"
+VITE_MAILER_URL=...                  # optional; defaults to same-origin /auth/send-code
+```
+
+Backend bindings (`wrangler.jsonc`):
+```
+kv_namespaces: MAPMYCAMS_STORE=<namespace id>   # accounts, floorplans, flags
 ```
 
 Backend (worker secrets):
 ```
-SUPABASE_URL=...
-SUPABASE_SERVICE_KEY=...
-AUTH_SECRET=<random 32+ chars>
+AUTH_SECRET=<random 32+ chars>     # signs sessions AND keys password + code hashes
 RESEND_API_KEY=re_...              # signup verification codes (https://resend.com/api-keys)
 EMAIL_FROM=MapMyCams <noreply@yourdomain.com>   # required: an address at your verified Resend domain
 STRIPE_SECRET_KEY=sk_live_...
@@ -253,7 +298,7 @@ restore instructions.
 | Rule | Value |
 |---|---|
 | Code | 6 digits, cryptographically random (rejection-sampled, so no modulo bias) |
-| Storage | Only a PBKDF2-SHA256 hash of the code — never the code itself |
+| Storage | Only a keyed hash of the code (HMAC-SHA256 with `AUTH_SECRET`) — never the code itself |
 | Lifetime | 10 minutes |
 | Wrong attempts | 5, then the code is dead and a new one is required |
 | Resend | One replacement per 60 seconds |
@@ -281,15 +326,25 @@ seeded row in the local store and signs in through the normal form.
 
 ## Security & GDPR
 
-- **Passwords are never stored.** Each one is stretched with PBKDF2-SHA256
-  (210,000 iterations) against a fresh 16-byte random salt, stored as
-  `pbkdf2$sha256$210000$<salt>$<hash>`. Comparison is constant-time. Hashes
-  written by older builds are upgraded transparently on the next sign-in.
+- **Passwords are never stored, and in server mode never even sent.** The
+  browser stretches the password with PBKDF2-SHA256 (210,000 iterations — in
+  server mode salted by the address so the same password yields the same value on
+  every device) and sends only the result. The server keys that with `AUTH_SECRET`
+  and stores `hmac-sha256:<digest>`, so a leaked record cannot be replayed against
+  the login endpoint; comparison is constant-time. The API refuses anything not
+  shaped like a client hash of at least 100,000 iterations, so it cannot be talked
+  into storing something cheap. Local-mode hashes from older builds are upgraded
+  on the next sign-in.
+- **Session tokens are signed, not random.** A 30-day HS256 JWT carrying the
+  account id and email, verified on every request; a token for a deleted or
+  unverified account is rejected. (`api/_lib.js` decodes the signature to bytes
+  before verifying — passing the base64 string made every token fail, which is
+  why `/me` answered 401 for valid sessions until it was fixed.)
 - **Sessions are random 32-byte tokens with a 30-day expiry**, not bare user ids.
   Expired or unknown sessions are rejected and cleared. A legacy bare-id session
   is migrated to a token on first read.
 - **Brute-force throttling** — see the table above.
-- Floorplans stored as encrypted-at-rest JSON in Supabase (disk encryption); RLS isolates each user's rows.
+- Floorplans are stored under the owner's account id in Cloudflare KV, so one account's layouts are only reachable with that account's session token.
 - Local (no-backend) mode keeps the database in the most durable storage the
   browser will actually grant. Browsers refuse storage entirely in third-party
   frames and some private modes, so the backend is chosen by probing rather than

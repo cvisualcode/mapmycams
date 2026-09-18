@@ -24,6 +24,12 @@ jobs:
         run: npm install
 
       - name: Build app
+        # The accounts API is served by the Worker on the custom domain, so the
+        # Pages build points at it rather than keeping a second, browser-local
+        # set of accounts on *.pages.dev. Baked in at build time — change it here,
+        # not in the dashboard.
+        env:
+          VITE_API_URL: https://mapmycams.dev
         run: npm run build
 
       - name: Deploy to Cloudflare Pages

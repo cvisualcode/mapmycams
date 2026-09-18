@@ -5,13 +5,18 @@
 // PBKDF2-SHA256 (210,000 iterations) and a fresh random salt per account, and
 // sessions are random 32-byte tokens with an expiry — never a raw user id.
 
-const API_URL = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL) || ''
+// Where the API lives. Empty (the default) means "this origin", which is where
+// the deployed worker serves /auth/*. In the sandbox preview that path belongs
+// to the Vite dev server, so server calls there report "no server" and the local
+// account store takes over — see apiRaw().
+const API_URL = ((typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL) || '').replace(/\/+$/, '')
 // Where the verification code is actually emailed from. The default is the same
 // origin, which is where the deployed worker serves /auth/send-code. Override
 // with VITE_MAILER_URL if the API lives on another host.
 const MAILER_URL = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_MAILER_URL) || '/auth/send-code'
 const DB_KEY = 'mmc_accounts_v1'
 const SESSION_KEY = 'mmc_session_v1'
+const TOKEN_KEY = 'mmc_token_v1'
 const ANALYTICS_KEY = 'mmc_analytics_v1'
 const FLOORS_KEY = 'mmc_floorplans_v1'
 const PENDING_KEY = 'mmc_pending_verification_v1'
@@ -271,6 +276,22 @@ export async function verifyPassword(password, stored) {
   return { ok: timingSafeEqual(legacyHash(password), stored), needsRehash: true }
 }
 
+/**
+ * The value sent to the server instead of a password: the same PBKDF2 stretch as
+ * a local account, but salted by the address, so the same password yields the
+ * same value on every device while two accounts never share a hash.
+ *
+ * The password itself never leaves the browser, and the server adds its own
+ * keyed layer (`hashPassword` in api/_lib.js), so a leaked record is not a usable
+ * credential. The server requires this shape and at least 100,000 iterations, so
+ * it cannot be talked into storing something cheap.
+ */
+export async function wireCredential(email, password) {
+  const salt = sha256(new TextEncoder().encode(String(email || '').trim().toLowerCase()))
+  const bits = await derive(password, salt, PBKDF2_ITERATIONS)
+  return `pbkdf2$sha256$${PBKDF2_ITERATIONS}$${toB64(salt)}$${toB64(bits)}`
+}
+
 // ─── Storage ─────────────────────────────────────────────────────────────────
 
 /** JSON.parse that never throws — a corrupted store must not brick the app. */
@@ -365,6 +386,14 @@ function startSession(userId) {
 
 function clearSession() { ls().removeItem(SESSION_KEY) }
 
+// ─── Server session ──────────────────────────────────────────────────────────
+// The account service issues a signed token; keeping it beside the local session
+// is what keeps a signed-in user signed in across reloads — and, because the
+// account lives on the server, on another device too.
+
+function serverToken() { return ls().getItem(TOKEN_KEY) }
+function setServerToken(token) { if (token) ls().setItem(TOKEN_KEY, token); else ls().removeItem(TOKEN_KEY) }
+
 function readSession() {
   const raw = ls().getItem(SESSION_KEY)
   if (!raw) return null
@@ -413,30 +442,46 @@ export function track(event, props = {}) {
 
 // ─── Live backend calls (used only when VITE_API_URL is set) ─────────────────
 
+/** Headers for a server call, carrying the session token when there is one. */
+function serverHeaders() {
+  const token = serverToken()
+  return { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }
+}
+
 async function api(path, body, method = 'POST') {
-  if (!API_URL) throw new Error('demo')
+  // Only talk to the server once it has issued a session. Before that the local
+  // store is authoritative, which is what keeps the app fully usable when it is
+  // not deployed anywhere.
+  if (!serverToken()) throw new Error('demo')
   const res = await fetch(`${API_URL}${path}`, {
-    method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined,
+    method, headers: serverHeaders(), body: body ? JSON.stringify(body) : undefined,
   })
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Request failed')
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error || `Request failed (${res.status})`)
+  }
   return res.json()
 }
 
 /**
  * POST that returns the parsed body even on 4xx. The auth endpoints answer 403
  * with `pendingVerification`, and api() would flatten that into a plain error.
- * Returns `{ demo: true }` when no backend is configured, as api() does.
+ *
+ * `server` reports whether a JSON API answered at all. A 404 or an HTML reply
+ * means nothing is serving the API on this origin — the Vite dev server in the
+ * sandbox preview, or any static-only host — which is the signal to use the
+ * local account store rather than showing the user an error.
  */
 async function apiRaw(path, body) {
-  if (!API_URL) return { demo: true }
   try {
     const res = await fetch(`${API_URL}${path}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined,
+      method: 'POST', headers: serverHeaders(), body: body ? JSON.stringify(body) : undefined,
     })
-    return { ok: res.ok, status: res.status, data: await res.json().catch(() => ({})) }
+    const type = res.headers.get('content-type') || ''
+    if (!type.includes('application/json')) return { server: false, ok: false, status: res.status, data: {} }
+    return { server: true, ok: res.ok, status: res.status, data: await res.json().catch(() => ({})) }
   } catch (err) {
-    return { ok: false, status: 0, data: { error: err.message } }
+    return { server: false, ok: false, status: 0, data: { error: err.message } }
   }
 }
 
@@ -516,17 +561,33 @@ export async function login(identifier, password) {
   const id = String(identifier || '').trim().toLowerCase()
   if (!id || !password) throw new Error('Enter your email and password')
 
-  const live = await apiRaw('/auth/login', { identifier: id, password })
-  if (!live.demo) {
+  // The server is asked first: an account that lives there works on any device,
+  // and its plan and add-ons come from the account rather than this browser.
+  const live = await apiRaw('/auth/login', { identifier: id, credential: await wireCredential(id, password) })
+  if (live.server) {
     // An unverified account comes back as 403 + pendingVerification.
     if (live.data.pendingVerification) {
       setPending(live.data.email || id)
       return { pendingVerification: true, email: live.data.email || id }
     }
-    if (!live.ok) throw new Error(live.data.error || 'Request failed')
-    return live.data.user
+    if (live.ok) {
+      setServerToken(live.data.token)
+      track('login_success', { identifier: id, server: true })
+      return live.data.user
+    }
+    // The server doesn't know this account — but one created here before the
+    // server existed, or on a host that has none, is still valid in this browser.
+    // A wrong password fails both ways, so this cannot sign anyone in falsely.
+    const local = await loginLocally(id, password).catch(() => null)
+    if (local) return local
+    throw new Error(live.data.error || 'Invalid email/username or password')
   }
 
+  return loginLocally(id, password)
+}
+
+/** Sign in against the accounts stored in this browser (no server involved). */
+async function loginLocally(id, password) {
   const db = loadDB()
   const user = findUser(db, id)
   // Throttle by account id when the account exists, so switching between
@@ -581,8 +642,8 @@ export async function signup(email, password, name = '') {
   const problem = passwordProblem(password)
   if (problem) throw new Error(problem)
 
-  const live = await apiRaw('/auth/signup', { email: id, password, name })
-  if (!live.demo) {
+  const live = await apiRaw('/auth/signup', { email: id, credential: await wireCredential(id, password), name })
+  if (live.server) {
     if (!live.ok) throw new Error(live.data.error || 'Could not create the account')
     setPending(id)
     track('signup_started', { identifier: id })
@@ -666,8 +727,9 @@ export async function verifyEmail(email, code) {
   if (!/^\d{6}$/.test(clean)) throw new Error('Enter the 6-digit code from the email')
 
   const live = await apiRaw('/auth/verify', { email: id, code: clean })
-  if (!live.demo) {
+  if (live.server) {
     if (!live.ok) throw new Error(live.data.error || 'That code is not correct')
+    setServerToken(live.data.token)
     cancelPendingVerification()
     track('email_verified', { identifier: id })
     return live.data.user
@@ -706,7 +768,7 @@ export async function resendCode(email) {
   const id = String(email || '').trim().toLowerCase()
 
   const live = await apiRaw('/auth/resend', { email: id })
-  if (!live.demo) {
+  if (live.server) {
     if (!live.ok) throw new Error(live.data.error || 'Could not send another code')
     setPending(id)
     return { ...live.data, email: id }
@@ -730,12 +792,23 @@ export async function resendCode(email) {
 
 export async function logout() {
   try { await api('/auth/logout', {}) } catch { /* local mode */ }
+  setServerToken(null)
   clearSession()
   track('logout', {})
 }
 
 export async function getMe() {
-  try { return await api('/me', null, 'GET') } catch (e) { if (e.message !== 'demo') return null }
+  if (serverToken()) {
+    try {
+      const u = await api('/me', null, 'GET')
+      if (u) return u
+    } catch (err) {
+      // A 401 means the session is over, so drop it. Anything else (offline, a
+      // 5xx) leaves the token alone, so a flaky network cannot sign anyone out.
+      if (/Unauthorised/i.test(err.message)) setServerToken(null)
+      else return null
+    }
+  }
   return publicUser(sessionUser())
 }
 
@@ -798,28 +871,56 @@ export async function toggle2FA() {
   return db.users[user.id].twoFA
 }
 
-// ─── Floorplans (cloud storage in live mode, localStorage in demo) ───────────
+// ─── Floorplans ──────────────────────────────────────────────────────────────
+// Written to the browser always, and to the account as well once the server has
+// issued a session, so a layout follows the user to another device. Reads merge
+// the two lists and de-duplicate by id, which means a plan drawn before signing
+// in — or while offline, or on a host with no server — can never disappear.
 
-export async function listFloorplans() {
-  try { return await api('/floorplans', null, 'GET') } catch (e) { if (e.message !== 'demo') throw e }
+/** Plans held in this browser, scoped to a local account when one is signed in. */
+function localFloorplans() {
   const user = sessionUser()
   const all = safeParse(ls().getItem(FLOORS_KEY), {})
-  return Object.values(all).filter((f) => !user || f.owner === user.id).sort((a, b) => b.updated - a.updated)
+  return Object.values(all).filter((f) => !user || !f.owner || f.owner === user.id)
+}
+
+function writeLocalPlan(plan) {
+  const all = safeParse(ls().getItem(FLOORS_KEY), {})
+  all[plan.id] = plan
+  ls().setItem(FLOORS_KEY, JSON.stringify(all))
+}
+
+export async function listFloorplans() {
+  const local = localFloorplans()
+  if (!serverToken()) return local.sort((a, b) => b.updated - a.updated)
+  try {
+    const remote = await api('/floorplans', null, 'GET')
+    const byId = new Map(local.map((f) => [f.id, f]))
+    for (const row of remote) byId.set(row.id, row)
+    return [...byId.values()].sort((a, b) => (b.updated || 0) - (a.updated || 0))
+  } catch { return local }
 }
 
 export async function saveFloorplan(name, data, id = null) {
   track('floorplan_saved', { id })
-  try { return await api('/floorplans', { id, name, data }) } catch (e) { if (e.message !== 'demo') throw e }
   const user = sessionUser()
-  const all = safeParse(ls().getItem(FLOORS_KEY), {})
   const plan = { id: id || 'fp_' + Date.now(), owner: user ? user.id : null, name, data, updated: Date.now() }
-  all[plan.id] = plan
-  ls().setItem(FLOORS_KEY, JSON.stringify(all))
+  // The browser copy is written first: a plan is never lost to a failed request.
+  writeLocalPlan(plan)
+  if (serverToken()) {
+    try {
+      const row = await api('/floorplans', { id: plan.id, name, data })
+      writeLocalPlan({ ...plan, ...row })
+      return row
+    } catch { /* the local copy already holds it */ }
+  }
   return plan
 }
 
 export async function deleteFloorplan(id) {
-  try { await api(`/floorplans/${id}`, null, 'DELETE') } catch (e) { if (e.message !== 'demo') throw e }
+  if (serverToken()) {
+    try { await api(`/floorplans/${id}`, null, 'DELETE') } catch { /* not on the server */ }
+  }
   const all = safeParse(ls().getItem(FLOORS_KEY), {})
   delete all[id]
   ls().setItem(FLOORS_KEY, JSON.stringify(all))

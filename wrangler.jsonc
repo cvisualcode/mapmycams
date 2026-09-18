@@ -2,6 +2,16 @@
   "name": "mapmycams",
   "main": "api/index.js",
   "compatibility_date": "2026-08-15",
+  // Accounts live here: one key per record (see api/_lib.js). KV needs no
+  // database to provision, which is what keeps sign-in working across devices
+  // without a second vendor account.
+  "kv_namespaces": [
+    { "binding": "MAPMYCAMS_STORE", "id": "5b55b1ce857a418882882f68fcf17790" }
+  ],
+  "vars": {
+    // Absolute origin of the app — used for Stripe redirect URLs.
+    "APP_URL": "https://mapmycams.dev"
+  },
   // The mailer endpoint can send real email from the verified domain, so the
   // *.workers.dev and preview URLs are switched off: they are extra public
   // entry points that bypass the custom domain. The domain is a Custom Domain
@@ -15,6 +25,9 @@
     "run_worker_first": [
       "/auth/*",
       "/me",
+      // Both the collection and its members: /floorplans/* alone leaves POST
+      // /floorplans to the static handler, which answers 405.
+      "/floorplans",
       "/floorplans/*",
       "/billing/*",
       "/webhooks/*",

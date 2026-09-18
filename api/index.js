@@ -2,7 +2,7 @@
 // Mount as a Cloudflare Worker module or Node serverless catch-all.
 // Routes:
 //   POST /auth/signup | /auth/verify | /auth/resend | /auth/login | /auth/logout
-//   POST /auth/send-code  (mailer only — needs no database)
+//   POST /auth/send-code  (mailer only — for browsers with no server session)
 //   GET  /me
 //   GET/POST/DELETE /floorplans(/:id)
 //   POST /billing/checkout | /billing/portal | /billing/cancel
@@ -10,11 +10,15 @@
 //   POST /ai/suggest  (rate-limited, premium only)
 //   POST /analytics
 //   GET  /admin/users | POST /admin/set-plan | POST /admin/flag
+//
+// Accounts, floorplans and flags live in Cloudflare KV (api/_lib.js). Passwords
+// arrive already stretched by the browser, so this process never sees one.
 
 import {
-  signToken, verifyToken, hashPassword, verifyPassword, db, dbUpsert,
-  stripeCheckoutSession, stripePortalSession, verifyStripeSignature,
-  generateVerificationCode, hashCode, verifyCode, sendVerificationEmail,
+  signToken, verifyToken, hashPassword, verifyPassword,
+  getUser, listUsers, saveUser, listFloorplans, saveFloorplan, deleteFloorplan, setFlag,
+  stripeCheckoutSession, stripePortalSession, verifyStripeSignature, stripeConfigured,
+  generateVerificationCode, hashCode, verifyCode, credentialProblem, sendVerificationEmail,
   emailConfigured, resendCooldownRemaining, CODE_TTL_MS, CODE_MAX_ATTEMPTS,
   json, cors, rateLimit,
 } from './_lib.js'
@@ -30,6 +34,9 @@ const PRICE_MAP = () => ({
   brands: { price: globalThis.env.PRICE_BRANDS, mode: 'payment' },
 })
 
+/** The one-off add-ons, used when there are no Stripe prices to read a mode from. */
+const ADDON_ITEMS = ['ai_pack', 'pdf_report', 'family', 'brands']
+
 /** The only origins allowed to reach the verification mailer. */
 const MAILER_ORIGIN = /^https?:\/\/([a-z0-9-]+\.)?(mapmycams\.dev|mapmycams\.pages\.dev|localhost(:\d+)?)$/i
 
@@ -44,12 +51,21 @@ function mailerOriginAllowed(request) {
   return Boolean(origin) && MAILER_ORIGIN.test(origin)
 }
 
+/** The signed-in account, or null. */
 async function authUser(request) {
   const token = (request.headers.get('Authorization') || '').replace('Bearer ', '')
-  const userId = token && await verifyToken(token)
-  if (!userId) return null
-  const users = await db('users', { eq: { id: userId } })
-  return users[0] || null
+  const claims = token && await verifyToken(token)
+  if (!claims) return null
+  const user = await getUser(claims.email)
+  return user && user.id === claims.id ? user : null
+}
+
+/** Look an account up by id as well as email — admin and webhook callers use ids. */
+async function findAccount(ref) {
+  const value = String(ref || '').trim()
+  if (!value) return null
+  if (value.includes('@')) return getUser(value)
+  return (await listUsers()).find((row) => row.id === value) || null
 }
 
 // ── Email verification ───────────────────────────────────────────────────────
@@ -57,7 +73,7 @@ async function authUser(request) {
 // it is entered, so the planner is unusable before the address is proven. Only
 // the code's hash is stored server-side.
 
-/** The client-visible shape of a user row. */
+/** The client-visible shape of an account. */
 function publicRow(u) {
   return {
     id: u.id, email: u.email, name: u.name, plan: u.plan,
@@ -80,17 +96,17 @@ async function deliverCode(email, code) {
   }
 }
 
-/** Issue a fresh code for an existing row: store the hash, then email it. */
+/** Issue a fresh code for an existing account: store the hash, then email it. */
 async function issueCode(user) {
   const code = generateVerificationCode()
-  await dbUpsert('users', [{
-    id: user.id,
+  await saveUser({
+    email: user.email,
     email_verified: false,
     verification_code_hash: await hashCode(code),
     verification_expires: new Date(Date.now() + CODE_TTL_MS).toISOString(),
     verification_attempts: 0,
     verification_sent_at: new Date().toISOString(),
-  }])
+  })
   return deliverCode(user.email, code)
 }
 
@@ -104,27 +120,30 @@ async function handle(request, env) {
 
   // ── Auth ───────────────────────────────────────────────────────────────────
   if (path === '/auth/signup' && method === 'POST') {
-    const { email, password, name } = await request.json()
+    const { email, credential, name } = await request.json()
     const id = String(email || '').trim().toLowerCase()
     if (!/^\S+@\S+\.\S+$/.test(id)) return json({ error: 'Enter a valid email address' }, 400)
-    const existing = await db('users', { eq: { email: id } })
-    if (existing[0]?.email_verified) return json({ error: 'An account with that email already exists' }, 409)
-    const userId = existing[0]?.id || crypto.randomUUID()
+    const problem = credentialProblem(credential)
+    if (problem) return json({ error: problem }, 400)
+    const existing = await getUser(id)
+    if (existing?.email_verified) return json({ error: 'An account with that email already exists' }, 409)
     const code = generateVerificationCode()
-    await dbUpsert('users', [{
+    const userId = existing?.id || crypto.randomUUID()
+    await saveUser({
       id: userId,
       email: id,
-      name: name || id.split('@')[0],
-      password_hash: await hashPassword(password),
-      plan: existing[0]?.plan || 'free',
-      addons: existing[0]?.addons || [],
-      created_at: existing[0]?.created_at || new Date().toISOString(),
+      name: name || existing?.name || id.split('@')[0],
+      password_hash: await hashPassword(credential),
+      plan: existing?.plan || 'free',
+      addons: existing?.addons || [],
+      is_admin: existing?.is_admin || false,
+      created_at: existing?.created_at || new Date().toISOString(),
       email_verified: false,
       verification_code_hash: await hashCode(code),
       verification_expires: new Date(Date.now() + CODE_TTL_MS).toISOString(),
       verification_attempts: 0,
       verification_sent_at: new Date().toISOString(),
-    }])
+    })
     return json({ pendingVerification: true, email: id, ...(await deliverCode(id, code)) })
   }
 
@@ -132,26 +151,31 @@ async function handle(request, env) {
   if (path === '/auth/verify' && method === 'POST') {
     const { email, code } = await request.json()
     const id = String(email || '').trim().toLowerCase()
-    const users = await db('users', { eq: { email: id } })
-    const user = users[0]
+    const user = await getUser(id)
     if (!user) return json({ error: 'No account is awaiting verification for that address' }, 404)
-    if (user.email_verified) return json({ token: await signToken(user.id), user: publicRow(user) })
+    if (user.email_verified) {
+      // Already proven. A session has to come from the password: answering with a
+      // token here would hand an account to anyone who knew the address.
+      return json({ error: 'That account is already verified — sign in with your password' }, 400)
+    }
     if (!user.verification_code_hash) return json({ error: 'Request a new code' }, 400)
     if (new Date(user.verification_expires).getTime() < Date.now()) return json({ error: 'That code has expired — request a new one' }, 400)
     const attempts = user.verification_attempts || 0
     if (attempts >= CODE_MAX_ATTEMPTS) return json({ error: 'Too many incorrect codes — request a new one' }, 429)
     if (!(await verifyCode(code, user.verification_code_hash))) {
-      await dbUpsert('users', [{ id: user.id, verification_attempts: attempts + 1 }])
+      await saveUser({ email: id, verification_attempts: attempts + 1 })
       return json({ error: `That code is not correct. ${CODE_MAX_ATTEMPTS - attempts - 1} attempt(s) left.` }, 400)
     }
-    await dbUpsert('users', [{ id: user.id, email_verified: true, verification_code_hash: null, verification_expires: null, verification_attempts: 0 }])
-    return json({ token: await signToken(user.id), user: publicRow({ ...user, email_verified: true }) })
+    const verified = await saveUser({
+      email: id, email_verified: true, verification_code_hash: null, verification_expires: null, verification_attempts: 0,
+    })
+    return json({ token: await signToken(verified), user: publicRow(verified) })
   }
 
-  // Mailer-only route: delivers a code the client generated. This is what makes
-  // real emails work *before* a database exists — accounts stay local and only
-  // the sending is server-side, which is what keeps RESEND_API_KEY secret.
-  // Once Supabase is connected the routes above take over and this is unused.
+  // Mailer-only route: delivers a code the client generated. This is what lets
+  // real email work in a browser that has no server session — accounts still live
+  // locally there, and only the sending is server-side, which is what keeps
+  // RESEND_API_KEY out of the browser. Accounts created here do not use it.
   if (path === '/auth/send-code' && method === 'POST') {
     if (!mailerOriginAllowed(request)) return json({ sent: false, error: 'Origin not allowed' }, 403)
     const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('x-forwarded-for') || 'unknown'
@@ -172,8 +196,7 @@ async function handle(request, env) {
   if (path === '/auth/resend' && method === 'POST') {
     const { email } = await request.json()
     const id = String(email || '').trim().toLowerCase()
-    const users = await db('users', { eq: { email: id } })
-    const user = users[0]
+    const user = await getUser(id)
     if (!user) return json({ error: 'No account is awaiting verification for that address' }, 404)
     if (user.email_verified) return json({ error: 'That account is already verified' }, 400)
     const wait = resendCooldownRemaining(user.verification_sent_at)
@@ -182,21 +205,21 @@ async function handle(request, env) {
   }
 
   if (path === '/auth/login' && method === 'POST') {
-    const { identifier, password } = await request.json()
-    const users = await db('users', { eq: { email: String(identifier).toLowerCase() } })
-    const user = users[0]
-    if (!user || !(await verifyPassword(password, user.password_hash))) return json({ error: 'Invalid email or password' }, 401)
+    const { identifier, credential } = await request.json()
+    const problem = credentialProblem(credential)
+    if (problem) return json({ error: problem }, 400)
+    const user = await getUser(String(identifier || '').trim().toLowerCase())
+    if (!user || !(await verifyPassword(credential, user.password_hash))) {
+      return json({ error: 'Invalid email or password' }, 401)
+    }
     // An unverified account gets no session — the client switches to the code screen.
     if (!user.email_verified) return json({ pendingVerification: true, email: user.email }, 403)
-    return json({ token: await signToken(user.id), user: publicRow(user) })
+    return json({ token: await signToken(user), user: publicRow(user) })
   }
 
-  if (path.startsWith('/auth/oauth/')) {
-    // Redirect to the provider via Supabase Auth; callback sets the session.
-    const provider = path.split('/').pop()
-    const redirect = `${env.SUPABASE_URL}/auth/v1/authorize?provider=${provider}&redirect_to=${env.APP_URL}/auth/callback`
-    return Response.redirect(redirect, 302)
-  }
+  // Tokens are stateless; the client drops its copy. Kept so the client's logout
+  // call succeeds instead of looking like a failure.
+  if (path === '/auth/logout' && method === 'POST') return json({ ok: true })
 
   // ── Current user ───────────────────────────────────────────────────────────
   if (path === '/me' && method === 'GET') {
@@ -205,28 +228,33 @@ async function handle(request, env) {
     return json(publicRow(user))
   }
 
-  // ── Floorplans (encrypted at rest by Supabase disk encryption) ─────────────
+  // ── Floorplans ─────────────────────────────────────────────────────────────
+  // Keyed by owner, so a layout belongs to the account rather than to the browser
+  // that drew it and follows the user to another device.
   if (path === '/floorplans' && method === 'GET') {
     const user = await authUser(request)
     if (!user) return json({ error: 'Unauthorised' }, 401)
-    return json(await db('floorplans', { eq: { owner_id: user.id } }))
+    return json(await listFloorplans(user.id))
   }
   if (path === '/floorplans' && method === 'POST') {
     const user = await authUser(request)
     if (!user) return json({ error: 'Unauthorised' }, 401)
     const { id, name, data } = await request.json()
-    if (user.plan === 'free') {
-      const existing = await db('floorplans', { eq: { owner_id: user.id } })
-      if (existing.length >= 1 && !id) return json({ error: 'Free tier limit: 1 floorplan' }, 402)
+    if (user.plan === 'free' && !id) {
+      const existing = await listFloorplans(user.id)
+      if (existing.length >= 1) return json({ error: 'Free tier limit: 1 floorplan' }, 402)
     }
-    const row = { id: id || crypto.randomUUID(), owner_id: user.id, name, data, updated_at: new Date().toISOString() }
-    await dbUpsert('floorplans', [row])
+    const row = {
+      id: id || crypto.randomUUID(), owner: user.id, name, data,
+      updated: Date.now(), updated_at: new Date().toISOString(),
+    }
+    await saveFloorplan(row)
     return json(row)
   }
   if (path.startsWith('/floorplans/') && method === 'DELETE') {
     const user = await authUser(request)
     if (!user) return json({ error: 'Unauthorised' }, 401)
-    await db('floorplans', { method: 'DELETE', eq: { id: path.split('/')[2], owner_id: user.id } })
+    await deleteFloorplan(user.id, path.split('/')[2])
     return json({ ok: true })
   }
 
@@ -236,13 +264,26 @@ async function handle(request, env) {
     if (!user) return json({ error: 'Unauthorised' }, 401)
     const { item } = await request.json()
     const entry = PRICE_MAP()[item]
-    if (!entry || !entry.price) return json({ error: 'Unknown plan or missing Stripe price env' }, 400)
+    if (!entry) return json({ error: 'Unknown plan or add-on' }, 400)
+
+    // Without Stripe keys there is nothing to charge, so grant the entitlement the
+    // way the browser-only build does. This keeps the pricing flow demonstrable and
+    // switches itself off the moment a real secret key is set.
+    if (!stripeConfigured() || !entry.price) {
+      const patch = ADDON_ITEMS.includes(item)
+        ? { email: user.email, addons: [...new Set([...(user.addons || []), item])] }
+        : { email: user.email, plan: item }
+      const row = await saveUser(patch)
+      return json({ demo: true, user: publicRow(row) })
+    }
+
     const session = await stripeCheckoutSession({ priceId: entry.price, userId: user.id, email: user.email, mode: entry.mode })
     return json({ url: session.url })
   }
   if (path === '/billing/portal' && method === 'POST') {
     const user = await authUser(request)
-    if (!user || !user.stripe_customer_id) return json({ error: 'No billing profile' }, 400)
+    if (!user) return json({ error: 'Unauthorised' }, 401)
+    if (!stripeConfigured() || !user.stripe_customer_id) return json({ demo: true })
     const session = await stripePortalSession(user.stripe_customer_id)
     return json({ url: session.url })
   }
@@ -250,8 +291,8 @@ async function handle(request, env) {
     const user = await authUser(request)
     if (!user) return json({ error: 'Unauthorised' }, 401)
     // Cancellation happens in the Stripe billing portal; here we just flag it.
-    await dbUpsert('users', [{ id: user.id, plan: 'free', updated_at: new Date().toISOString() }])
-    return json({ ok: true, plan: 'free' })
+    const row = await saveUser({ email: user.email, plan: 'free' })
+    return json({ ok: true, plan: row.plan, user: publicRow(row) })
   }
 
   // ── Stripe webhook: keep subscription status in sync ───────────────────────
@@ -262,18 +303,19 @@ async function handle(request, env) {
     const event = JSON.parse(payload)
     if (event.type === 'checkout.session.completed') {
       const s = event.data.object
-      const userId = s.client_reference_id || s.metadata?.userId
-      if (s.mode === 'subscription') {
-        await dbUpsert('users', [{ id: userId, plan: s.metadata?.plan || 'premium_monthly', stripe_customer_id: s.customer }])
-      } else {
-        const users = await db('users', { eq: { id: userId } })
-        const addons = new Set([...(users[0]?.addons || []), s.metadata?.addon].filter(Boolean))
-        await dbUpsert('users', [{ id: userId, addons: [...addons], stripe_customer_id: s.customer }])
+      const account = await findAccount(s.client_reference_id || s.metadata?.userId)
+      if (account) {
+        if (s.mode === 'subscription') {
+          await saveUser({ email: account.email, plan: s.metadata?.plan || 'premium_monthly', stripe_customer_id: s.customer })
+        } else {
+          const addons = new Set([...(account.addons || []), s.metadata?.addon].filter(Boolean))
+          await saveUser({ email: account.email, addons: [...addons], stripe_customer_id: s.customer })
+        }
       }
     }
     if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.paused') {
-      const sub = event.data.object
-      await dbUpsert('users', [{ id: sub.metadata?.userId, plan: 'free' }])
+      const account = await findAccount(event.data.object.metadata?.userId)
+      if (account) await saveUser({ email: account.email, plan: 'free' })
     }
     return json({ received: true })
   }
@@ -291,9 +333,12 @@ async function handle(request, env) {
   }
 
   // ── Analytics ──────────────────────────────────────────────────────────────
+  // Accepted and acknowledged but not stored: the browser keeps its own event log
+  // for the admin panel, and nothing unauthenticated gets to spend the KV write
+  // budget that sign-in needs.
   if (path === '/analytics' && method === 'POST') {
-    const { event, props } = await request.json().catch(() => ({}))
-    await db('analytics_events', { method: 'POST', body: { event, props: props || {}, created_at: new Date().toISOString() } })
+    const { event } = await request.json().catch(() => ({}))
+    if (typeof event !== 'string' || !event) return json({ error: 'An event name is required' }, 400)
     return json({ ok: true })
   }
 
@@ -301,24 +346,40 @@ async function handle(request, env) {
   if (path === '/admin/users' && method === 'GET') {
     const user = await authUser(request)
     if (!user?.is_admin) return json({ error: 'Forbidden' }, 403)
-    return json(await db('users', { select: 'id,email,plan,addons,is_admin,created_at' }))
+    const rows = await listUsers()
+    return json(rows.map((row) => ({
+      id: row.id, email: row.email, name: row.name, plan: row.plan,
+      addons: row.addons || [], isAdmin: !!row.is_admin, createdAt: row.created_at,
+    })))
   }
   if (path === '/admin/set-plan' && method === 'POST') {
     const admin = await authUser(request)
     if (!admin?.is_admin) return json({ error: 'Forbidden' }, 403)
     const { userId, plan } = await request.json()
-    await dbUpsert('users', [{ id: userId, plan }])
-    return json({ ok: true })
+    const account = await findAccount(userId)
+    if (!account) return json({ error: 'No such account' }, 404)
+    const row = await saveUser({ email: account.email, plan })
+    return json(publicRow(row))
   }
   if (path === '/admin/flag' && method === 'POST') {
     const admin = await authUser(request)
     if (!admin?.is_admin) return json({ error: 'Forbidden' }, 403)
     const { flag, enabled } = await request.json()
-    await dbUpsert('feature_flags', [{ key: flag, enabled }])
-    return json({ ok: true })
+    await setFlag(flag, enabled)
+    return json({ ok: true, flag, enabled: Boolean(enabled) })
   }
 
   return json({ error: 'Not found' }, 404)
+}
+
+/** Any unhandled failure answers with its message rather than an opaque 500. */
+async function dispatch(request, env) {
+  try {
+    return await handle(request, env)
+  } catch (err) {
+    globalThis.env = globalThis.env || env
+    return json({ error: err?.message || 'Server error' }, 500)
+  }
 }
 
 function suggestSpots(walls, cameras) {
@@ -334,5 +395,5 @@ function suggestSpots(walls, cameras) {
   return spots
 }
 
-export default { fetch: handle }
-export { handle }
+export default { fetch: dispatch }
+export { dispatch as handle }
