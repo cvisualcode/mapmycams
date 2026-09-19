@@ -64,6 +64,75 @@ export function deserializePlan(serialized) {
 }
 
 /**
+ * A plan from anywhere, as the editor's own shape: `{ activeFloor, floors }`.
+ *
+ * Two shapes have been written into people's accounts. The dashboard saves the four
+ * collections on their own — the floor that happened to be on screen and nothing else —
+ * while the editor, its share links and its undo timeline all speak `{ floors: [...] }`.
+ * A flat plan is read as the ground floor, which is what it was when it was written.
+ *
+ * Reading it any other way is how a layout comes back empty: a plan drawn on the ground
+ * floor and saved while the first floor was on screen *was* saved as an empty plan.
+ *
+ * A floor keeps only what is an array of things, and a plan with no floors at all is one
+ * empty floor rather than none, so every caller can index floor 0 without a guard.
+ */
+export function normalizePlanData(data, floorCount = 1) {
+  const list = (value) => (Array.isArray(value) ? value : [])
+  const asFloor = (floor) => ({
+    walls: list(floor?.walls),
+    cameras: list(floor?.cameras),
+    objects: list(floor?.objects),
+    wires: list(floor?.wires),
+  })
+  const floors = Array.isArray(data?.floors) && data.floors.length ? data.floors.map(asFloor) : [asFloor(data)]
+  const want = Math.max(1, Math.floor(Number(floorCount)) || 1)
+  while (floors.length < want) floors.push(asFloor(null))
+  const active = Number(data?.activeFloor)
+  return {
+    activeFloor: Number.isInteger(active) && active >= 0 && active < floors.length ? active : 0,
+    floors,
+  }
+}
+
+/**
+ * The document a saved plan is: every floor, and the one that was on screen.
+ *
+ * This is what the dashboard stores and what a share link carries, and it is deliberately
+ * the same shape `normalizePlanData` reads, so the two ends cannot drift apart again — the
+ * round trip through JSON is tested as one thing rather than two halves that each look
+ * right on their own.
+ */
+export function planDocument({ floors = [], activeFloor = 0 } = {}) {
+  const list = (value) => (Array.isArray(value) ? value : [])
+  const active = Number(activeFloor)
+  return {
+    version: 2,
+    activeFloor: Number.isInteger(active) && active >= 0 ? active : 0,
+    floors: (Array.isArray(floors) ? floors : []).map((floor) => ({
+      walls: list(floor?.walls),
+      cameras: list(floor?.cameras),
+      objects: list(floor?.objects),
+      wires: list(floor?.wires),
+    })),
+  }
+}
+
+/**
+ * Is there anything in this plan at all?
+ *
+ * Asked before saving on the way out of a tab, so an empty session does not leave a plan
+ * behind: a row on the dashboard that opens to nothing is worse than no row, and for a
+ * Free account it also uses up the one plan it is allowed.
+ */
+export function planHasContent(plan) {
+  const floors = Array.isArray(plan?.floors) ? plan.floors : []
+  return floors.some((floor) => ['walls', 'cameras', 'objects', 'wires'].some((key) => (
+    Array.isArray(floor?.[key]) && floor[key].length > 0
+  )))
+}
+
+/**
  * A timeline of plan snapshots.
  *
  * `past` is chronological with the newest entry last — which, once anything has been

@@ -9,7 +9,7 @@ import { planShareUrl } from './monetisation/share'
 import * as api from './monetisation/api'
 import { planCameraPlacement } from './editor/coverage-plan'
 import { MAX_ROOM_NAME, ensureRoomLabels, normalizeRoomName, renameRoom, roomDisplayName } from './editor/room-names'
-import { createHistory, deserializePlan, serializePlan } from './editor/history'
+import { createHistory, deserializePlan, serializePlan, normalizePlanData, planDocument } from './editor/history'
 import {
   createGestureTracker, pointerDown, pointerMove, pointerUp, pointerCancel,
   beginPinch, pinchTransform, trackedPoints,
@@ -92,16 +92,23 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   // A saved floorplan or a shared #plan= link arrives as a prop and is read once,
   // on mount: the shell remounts the editor with a new `key` for each plan.
   const snap = initialSnapshot || null
-  const [walls, setWalls] = useState(() => (snap && Array.isArray(snap.walls) ? snap.walls : []))
-  const [cameras, setCameras] = useState(() => (snap && Array.isArray(snap.cameras) ? snap.cameras : []))
+  // Every floor of it, not only the one that was on screen when it was saved: a plan
+  // opened from the dashboard puts its upper floors back too, and a plan saved before
+  // this read the flat shape, which is read as the ground floor it was drawn on.
+  const [openedPlan] = useState(() => normalizePlanData(snap, FLOOR_NAMES.length))
+  const openedFloor = openedPlan.floors[openedPlan.activeFloor]
+  const [walls, setWalls] = useState(() => openedFloor.walls)
+  const [cameras, setCameras] = useState(() => openedFloor.cameras)
   const [currentWall, setCurrentWall] = useState(null)
   const [rectStart, setRectStart] = useState(null)
   const [rectEnd, setRectEnd] = useState(null)
-  const [wires, setWires] = useState(() => (snap && Array.isArray(snap.wires) ? snap.wires : []))
+  const [wires, setWires] = useState(() => openedFloor.wires)
   const [currentWire, setCurrentWire] = useState(null)
   const [wireSnap, setWireSnap] = useState(null)
-  const [activeFloor, setActiveFloor] = useState(0)
-  const floorsRef = useRef({})
+  const [activeFloor, setActiveFloor] = useState(() => openedPlan.activeFloor)
+  // Keyed by floor number, as `switchFloor` and `applyPlan` write it. The floor on
+  // screen is live state and wins there; these are the ones that are not.
+  const floorsRef = useRef({ ...openedPlan.floors })
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [zoom, setZoom] = useState(1)
   const [origin, setOrigin] = useState({ x: 0, y: 0 })
@@ -109,7 +116,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   const [selectedCamera, setSelectedCamera] = useState(null)
   const [placingCamera, setPlacingCamera] = useState(null)
   const [rotateDrag, setRotateDrag] = useState(false)
-  const [objects, setObjects] = useState(() => (snap && Array.isArray(snap.objects) ? snap.objects : []))
+  const [objects, setObjects] = useState(() => openedFloor.objects)
   const [placingObject, setPlacingObject] = useState(null)
   const [selectedObject, setSelectedObject] = useState(null)
   const [selectedRoom, setSelectedRoom] = useState(null)
@@ -917,14 +924,26 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   }, [])
 
   // ── Cloud save / load bridge used by the dashboard shell ──
+  // The whole plan, every floor. What used to travel through here was the four
+  // collections of the floor that happened to be on screen, so a house drawn on the
+  // ground floor and saved while looking at the empty first floor was saved as an empty
+  // plan — a layout that came back with nothing in it. The floors that are not on screen
+  // are the ones `flushActiveFloor` keeps, and they go in the same document.
   useEffect(() => {
-    window.__mmcGetSnapshot = () => ({ version: 1, walls, cameras, objects, wires })
+    const wholePlan = () => planDocument({ floors: planFloors(), activeFloor })
+    window.__mmcGetSnapshot = wholePlan
+    // The share link builds its own flat copy from the floor on screen, so the app hands
+    // it the whole plan through the same kind of hook.
+    window.__mmcShareSnapshot = wholePlan
     window.__mmcSetSnapshot = (snapshot) => {
-      if (!snapshot) { setWalls([]); setCameras([]); setObjects([]); setWires([]); return }
-      if (Array.isArray(snapshot.walls)) setWalls(snapshot.walls)
-      if (Array.isArray(snapshot.cameras)) setCameras(snapshot.cameras)
-      if (Array.isArray(snapshot.objects)) setObjects(snapshot.objects)
-      if (Array.isArray(snapshot.wires)) setWires(snapshot.wires)
+      const plan = normalizePlanData(snapshot, FLOOR_NAMES.length)
+      const here = plan.floors[plan.activeFloor]
+      floorsRef.current = { ...plan.floors }
+      setActiveFloor(plan.activeFloor)
+      setWalls(here.walls)
+      setCameras(here.cameras)
+      setObjects(here.objects)
+      setWires(here.wires)
     }
   })
 

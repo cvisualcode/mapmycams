@@ -3,12 +3,13 @@
 // and admin panel. Views: auth → dashboard ⇄ editor / pricing / admin.
 // The editor itself lives in src/App.jsx and is mounted as <EditorApp />.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { EntitlementsProvider, useEntitlements } from './monetisation/EntitlementsContext'
 import { LoginScreen, VerifyEmailScreen, Dashboard, PricingPage, AdminPanel, UpgradeModal, CheckoutGate } from './monetisation/MonetisationUI'
 import LandingPage from './monetisation/LandingPage'
 import { visitorRoute } from './monetisation/routing'
 import { buildFloorplanSnapshot } from './monetisation/snapshotBridge'
+import { planHasContent } from './editor/history'
 import { readSharedPlan } from './monetisation/share'
 import EditorApp from './App.jsx'
 import EditorMobileMenu from './editor/mobile-menu.jsx'
@@ -36,6 +37,31 @@ function MonetisedApp() {
     setSharedPlan(snapshot)
     setView('editor')
   }, [])
+
+  // Leaving the editor is not the only way out of it: a closed tab, a phone locking, a
+  // back-swipe. Those used to take the layout with them, because nothing was written
+  // until the Dashboard button was pressed. This writes the same document on the way
+  // out — the browser's own copy is written synchronously, so it survives even if the
+  // request does not finish. A plan with nothing in it is not saved at all: a row that
+  // opens to an empty plan is worse than no row, and on the Free tier it is the one row.
+  //
+  // Registered here rather than beside the editor's own handlers because this component
+  // returns from several places further down, and a hook below those returns is a hook
+  // that is called on some renders and not others.
+  const saveOnLeaveRef = useRef(() => {})
+  useEffect(() => {
+    saveOnLeaveRef.current = () => {
+      const snapshot = buildFloorplanSnapshot()
+      if (!planHasContent(snapshot)) return
+      ent.saveFloorplan(loadedPlan ? loadedPlan.name : 'My floorplan', snapshot, loadedPlan ? loadedPlan.id : null).catch(() => {})
+    }
+  })
+  useEffect(() => {
+    if (view !== 'editor') return undefined
+    const leave = () => saveOnLeaveRef.current()
+    window.addEventListener('pagehide', leave)
+    return () => window.removeEventListener('pagehide', leave)
+  }, [view])
 
   if (ent.loading) return <div className="auth-screen"><p>Loading…</p></div>
 
@@ -86,7 +112,10 @@ function MonetisedApp() {
 
   function exitEditor() {
     const snapshot = buildFloorplanSnapshot()
-    if (snapshot) {
+    // An empty editor is not a plan: saving one leaves a row on the dashboard that opens
+    // to nothing, and on the Free tier it uses up the one plan the account has. A plan
+    // that already exists is saved whatever it holds now, so emptying one sticks.
+    if (snapshot && (planHasContent(snapshot) || loadedPlan)) {
       ent.saveFloorplan(loadedPlan ? loadedPlan.name : 'My floorplan', snapshot, loadedPlan ? loadedPlan.id : null).catch(() => {})
     }
     setSharedPlan(null)

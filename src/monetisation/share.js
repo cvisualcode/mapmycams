@@ -29,12 +29,32 @@ function fromBase64Url(value) {
 }
 
 /**
+ * The plan as the page actually holds it, when that is more than the caller passed.
+ *
+ * The share button hands this module the four collections of the floor on screen, which
+ * is a plan with one floor in it — the copy beside the button promises "floor by floor",
+ * and a link that quietly drops the first and second floors is a link to somebody else's
+ * house. The editor registers the whole plan through the same kind of window hook it
+ * uses for saving, and that is preferred here when it is there. In Node, and anywhere
+ * without an editor on the page, the caller's own snapshot is what gets encoded.
+ */
+function wholePlanOr(snapshot) {
+  if (typeof window !== 'undefined' && typeof window.__mmcShareSnapshot === 'function') {
+    try {
+      const whole = window.__mmcShareSnapshot()
+      if (whole && Array.isArray(whole.floors) && whole.floors.length) return whole
+    } catch { /* a hook that throws is a hook to ignore */ }
+  }
+  return snapshot
+}
+
+/**
  * The full shareable URL for a snapshot. Any fragment already on the page (a
  * plan someone opened this link from, say) is replaced rather than nested.
  */
 export function planShareUrl(snapshot, pageUrl = '') {
   const base = String(pageUrl).split('#')[0]
-  return `${base}${PREFIX}${toBase64Url(JSON.stringify(snapshot))}`
+  return `${base}${PREFIX}${toBase64Url(JSON.stringify(wholePlanOr(snapshot)))}`
 }
 
 /**

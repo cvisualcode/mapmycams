@@ -120,6 +120,36 @@ console.log('\nA furnished plan renders')
   check('the toolbar still offers to undo and redo', html.includes('Undo') && html.includes('Redo'))
 }
 
+console.log('\nA plan with more than one floor renders')
+{
+  // What the dashboard saves now: every floor, and the one that was on screen. The
+  // house is on the ground floor while the first floor is the one open — the case that
+  // used to save itself as an empty plan.
+  const metres = 80
+  const room = {
+    id: 1,
+    closed: true,
+    label: 'Hall',
+    points: [{ x: 0, y: 0 }, { x: 5 * metres, y: 0 }, { x: 5 * metres, y: 4 * metres }, { x: 0, y: 4 * metres }],
+  }
+  let html = ''
+  let error = null
+  try {
+    html = render({
+      version: 2,
+      activeFloor: 1,
+      floors: [
+        { walls: [room], cameras: [{ id: 2, x: metres, y: metres, rotation: 0, hFov: 90, distance: 8, color: '#4ade80', label: 'Cam 1' }], objects: [], wires: [] },
+        { walls: [], cameras: [{ id: 3, x: metres, y: metres, rotation: 0, hFov: 90, distance: 8, color: '#60a5fa', label: 'Cam 2' }], objects: [], wires: [] },
+      ],
+    })
+  } catch (e) {
+    error = e
+  }
+  check('a saved plan with upper floors renders', !error, error && error.message)
+  check('the floor it opened on is the one it counts', html.includes('1 camera on this plan'))
+}
+
 console.log('\nA room that needs repairing renders')
 {
   const points = [{ x: 0, y: 0 }, { x: 400, y: 0 }, { x: 400, y: 400 }]

@@ -6,7 +6,7 @@
 //
 //   bun run history:test
 
-import { createHistory, serializePlan, deserializePlan, DEFAULT_HISTORY_LIMIT } from '../src/editor/history.js'
+import { createHistory, serializePlan, deserializePlan, normalizePlanData, planDocument, planHasContent, DEFAULT_HISTORY_LIMIT } from '../src/editor/history.js'
 
 let failures = 0
 function check(label, ok, detail = '') {
@@ -103,6 +103,61 @@ console.log('\nA long session')
   check('the default limit is a sane length', DEFAULT_HISTORY_LIMIT >= 20 && DEFAULT_HISTORY_LIMIT <= 200)
   const d = createHistory()
   check('a non-string is refused rather than stored', d.record(undefined) === false && d.depth().past === 0)
+}
+
+console.log('\nA plan from anywhere')
+{
+  // Two shapes are out there, and getting this wrong is how a saved layout comes back
+  // empty: the dashboard used to save the floor that was on screen and nothing else.
+  const ground = { id: 1, closed: true, points: [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }] }
+  const flat = { version: 1, walls: [ground], cameras: [{ id: 2 }], objects: [{ id: 3, presetId: 'safe' }], wires: [{ id: 4 }] }
+  const asFlat = normalizePlanData(flat, 4)
+  check('the old flat plan is read as the ground floor', asFlat.activeFloor === 0 && asFlat.floors[0].walls.length === 1 && asFlat.floors[0].cameras.length === 1)
+  check('…with the floors above it put back as empty ones', asFlat.floors.length === 4 && asFlat.floors.slice(1).every((f) => f.walls.length === 0 && f.wires.length === 0))
+
+  // The regression this exists for: a house drawn on the ground floor, saved while an
+  // empty first floor was on screen. Every floor has to survive, or the plan that comes
+  // back is the empty one that happened to be visible.
+  const multi = { version: 2, activeFloor: 1, floors: [{ walls: [ground], cameras: [], objects: [], wires: [] }, { walls: [], cameras: [{ id: 9 }], objects: [], wires: [] }] }
+  const asMulti = normalizePlanData(multi, 4)
+  check('a multi-floor plan keeps the floor nobody was looking at', asMulti.floors[0].walls.length === 1)
+  check('…and the one that was', asMulti.activeFloor === 1 && asMulti.floors[1].cameras.length === 1)
+  check('…and is padded out to the floors the app has', asMulti.floors.length === 4)
+
+  // The undo timeline's own document is one of these too, so what undo restores is what
+  // the dashboard would save.
+  const timeline = normalizePlanData(JSON.parse(serializePlan({ floors: [{ walls: [ground] }, { walls: [] }], activeFloor: 1 })), 4)
+  check('the timeline\'s own shape reads back the same way', timeline.floors[0].walls.length === 1 && timeline.activeFloor === 1)
+
+  // The round trip the dashboard performs, end to end: the document the editor builds,
+  // through JSON, into the plan the editor reads back. Both halves are tested together
+  // because the bug this fixes was the two halves disagreeing about what a plan is.
+  const written = planDocument({
+    activeFloor: 1,
+    floors: [
+      { name: 'Ground', walls: [ground], cameras: [{ id: 2 }], objects: [], wires: [] },
+      { name: 'First', walls: [], cameras: [], objects: [{ id: 5, presetId: 'safe' }], wires: [] },
+    ],
+  })
+  const readBack = normalizePlanData(JSON.parse(JSON.stringify(written)), 4)
+  check('a saved plan comes back out of JSON with its ground floor intact', readBack.floors[0].walls.length === 1 && readBack.floors[0].cameras.length === 1)
+  check('\u2026and the floor that was on screen still on screen', readBack.activeFloor === 1 && readBack.floors[1].objects.length === 1)
+  check('a saved plan says which version it is', written.version === 2 && Array.isArray(written.floors))
+
+  check('an active floor that is not in the plan falls back to the ground', normalizePlanData({ activeFloor: 7, floors: [{}] }, 4).activeFloor === 0)
+  check('a floor number that is not a number falls back too', normalizePlanData({ activeFloor: 'first', floors: [{}] }, 4).activeFloor === 0)
+  const junk = normalizePlanData({ walls: 'nonsense', floors: [] }, 4)
+  check('a plan that is not a plan is one empty floor, not a crash', junk.floors.length === 4 && junk.floors.every((f) => Array.isArray(f.walls)))
+  const nothing = normalizePlanData(null, 0)
+  check('no plan at all is still something floor 0 can be indexed on', nothing.floors.length === 1 && nothing.floors[0].objects.length === 0)
+  check('a floor bent out of shape is straightened rather than dropped', normalizePlanData({ floors: [{ walls: [ground], objects: null, cameras: 'x' }] }).floors[0].walls.length === 1 && normalizePlanData({ floors: [{ objects: null }] }).floors[0].objects.length === 0)
+
+  // Asked before saving on the way out of a tab, so an empty session leaves no row behind.
+  check('a plan with nothing in it has no content', planHasContent(planDocument({ floors: normalizePlanData(null, 4).floors })) === false)
+  check('a wall on the third floor is content', planHasContent(planDocument({ floors: normalizePlanData({ floors: [{}, {}, { walls: [ground] }] }, 4).floors })) === true)
+  check('a camera on its own is content', planHasContent({ floors: [{ walls: [], cameras: [{ id: 1 }], objects: [], wires: [] }] }) === true)
+  check('a wire on its own is content', planHasContent({ floors: [{ wires: [{ id: 1 }] }] }) === true)
+  check('no plan at all has no content', planHasContent(null) === false && planHasContent(undefined) === false)
 }
 
 console.log(failures === 0 ? '\nAll timeline checks passed.\n' : `\n${failures} timeline check(s) failed.\n`)
