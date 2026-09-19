@@ -832,8 +832,12 @@ export function computeBlindSpots(walls, cameras, objects) {
           }
           for (const o of objects) {
             if (!o.blocksVision) continue
+            // A door or a safe on a wall has no x/y of its own — its centre has to be
+            // resolved from the wall it sits on, or it never blocks anything.
+            const c = objectCentre(o, closed)
+            if (!c) continue
             const halfW = ((o.width || 1) * 40) / 2, halfH = ((o.height || 1) * 40) / 2
-            if (Math.abs(o.x - x) < halfW + 8 && Math.abs(o.y - y) < halfH + 8 && Math.abs(o.x - cam.x) < Math.abs(dx) && Math.abs(o.y - cam.y) < Math.abs(dy)) return false
+            if (Math.abs(c.x - x) < halfW + 8 && Math.abs(c.y - y) < halfH + 8 && Math.abs(c.x - cam.x) < Math.abs(dx) && Math.abs(c.y - cam.y) < Math.abs(dy)) return false
           }
           return true
         })
@@ -845,15 +849,23 @@ export function computeBlindSpots(walls, cameras, objects) {
   return blind
 }
 
-export function segRayBlocked(cam, target, a1, a2, camWall, segWall) {
-  const d = (target.x - cam.x) * (a2.y - a1.y) - (target.y - cam.y) * (a2.x - a1.x)
+/**
+ * Does the segment from the camera to the target cross this wall segment?
+ *
+ * Takes plain coordinates, which is how the blind-spot sampler calls it. (It used to
+ * take two point objects while every caller passed numbers, so the arithmetic came
+ * out NaN and no wall ever blocked anything — blind spots were reported as covered
+ * whenever the angle and the range happened to fit, walls or no walls.)
+ */
+export function segRayBlocked(camX, camY, targetX, targetY, a1, a2, camWall, segWall) {
+  const d = (targetX - camX) * (a2.y - a1.y) - (targetY - camY) * (a2.x - a1.x)
   if (Math.abs(d) < 1e-9) return false
-  const t = ((a1.x - cam.x) * (a2.y - a1.y) - (a1.y - cam.y) * (a2.x - a1.x)) / d
-  const u = ((a1.x - cam.x) * (target.y - cam.y) - (a1.y - cam.y) * (target.x - cam.x)) / d
+  const t = ((a1.x - camX) * (a2.y - a1.y) - (a1.y - camY) * (a2.x - a1.x)) / d
+  const u = ((a1.x - camX) * (targetY - camY) - (a1.y - camY) * (targetX - camX)) / d
   if (!(t > 0.02 && t < 0.98 && u > 0 && u < 1)) return false
   // A camera inside a room isn't occluded by that room's own boundary for
   // targets in the same room; it IS blocked by other rooms' walls.
-  return segWall !== camWall || false
+  return segWall !== camWall
 }
 
 export function isPointInPolygon(x, y, polygon) {

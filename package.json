@@ -14,7 +14,9 @@
     "checkout:test": "node scripts/test-checkout-client.mjs",
     "landing:test": "node scripts/test-landing.mjs",
     "ai:test": "node scripts/test-ai.mjs",
-    "ai:key": "node scripts/push-ai-key.mjs"
+    "ai:key": "node scripts/push-ai-key.mjs",
+    "coverage:test": "node scripts/test-coverage.mjs",
+    "plan:test": "node scripts/test-plan.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",

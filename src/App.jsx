@@ -7,6 +7,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useEntitlements } from './monetisation/EntitlementsContext'
 import { planShareUrl } from './monetisation/share'
 import * as api from './monetisation/api'
+import { planCameraPlacement } from './editor/coverage-plan'
 import './App.css'
 import {
   PIXELS_PER_METER,
@@ -124,35 +125,49 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   // One sentence from the model about the layout it chose, shown on hover.
   const [aiNote, setAiNote] = useState('')
 
-  /** Ask the server's AI where the cameras should go, then fall back if it cannot answer. */
+  /**
+   * Place cameras where they cover the most.
+   *
+   * The AI is asked for positions as a *proposal* — it has read the plan, so its
+   * candidates are worth having — but the placement itself is decided by the
+   * coverage solver in src/editor/coverage-plan.js: sample the floor, weigh doors,
+   * windows, stairs, safes and outlets far above bare floor, then repeatedly take the
+   * position that covers the most still-uncovered weight and stop as soon as another
+   * camera is not worth having. That is what keeps the camera count down and the
+   * coverage up, which a model choosing coordinates by eye cannot promise.
+   */
   async function aiPlaceWithModel() {
     if (aiLocked) {
       if (showUpgrade) showUpgrade('AI camera placement', 'Let AI analyse your floorplan geometry and place cameras at the optimal spots.', 'ai_pack')
       return
     }
     setAiBusy(true)
-    let spots = []
-    let summary = ''
+    let proposals = []
+    let usedModel = false
     try {
       const res = await api.aiSuggestSpots({ walls, cameras, objects })
-      // Only the model's placements are worth taking: the in-browser solver below
-      // is stronger than the server's crude geometry fallback.
       if (res?.source === 'model' && Array.isArray(res.spots) && res.spots.length > 0) {
-        spots = res.spots
-        // Falls back to the model name, so the tooltip always says what answered.
-        summary = res.summary || (res.model ? `Placed by ${res.model}` : '')
+        proposals = res.spots
+        usedModel = true
       }
-    } catch { /* offline, not entitled or over quota — the local solver answers */ }
+    } catch { /* offline, not entitled or over quota — coverage still answers */ }
     setAiBusy(false)
-    if (spots.length === 0) {
-      setAiSource('local')
+
+    let result
+    try {
+      result = planCameraPlacement({ walls, objects, cameras, proposals })
+    } catch {
+      // The optimiser is pure geometry, so this should not happen; if it ever does,
+      // the older heuristic still places something rather than leaving a dead button.
       aiPlaceCameras()
       return
     }
-    setAiSource('model')
-    setAiNote(summary)
-    setCameras((prev) => [...prev, ...spots])
-    setAiBlindSpots(computeBlindSpots(walls, [...cameras, ...spots], objects))
+
+    setAiSource(usedModel ? 'model' : 'local')
+    setAiNote(result.summary)
+    if (result.cameras.length === 0) return
+    setCameras((prev) => [...prev, ...result.cameras])
+    setAiBlindSpots(computeBlindSpots(walls, [...cameras, ...result.cameras], objects))
   }
   // Short-lived confirmation from the toolbar (link copied, pop-up blocked…).
   const [toolNotice, setToolNotice] = useState(null)
@@ -765,8 +780,13 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
           <button onClick={aiPlaceWithModel} disabled={aiBusy} title="Premium: AI-suggested camera positions">
             {aiBusy ? '✨ Analysing the plan…' : '✨ AI Place Cameras'}{aiLocked ? ' 🔒' : ''}
           </button>
-          {aiSource === 'model' && (
-            <span className="hint" title={aiNote || 'Placed by the AI model on the server'}>✨ AI layout</span>
+          {aiNote && (
+            <span className="hint" title={aiSource === 'model'
+              ? 'The AI proposed positions; the coverage solver picked the final ones'
+              : 'Placed by the coverage solver'}
+            >
+              {aiSource === 'model' ? '✨ ' : '⚙️ '}{aiNote}
+            </span>
           )}
           <button onClick={runBlindSpotDetection} title="Premium: report areas no camera can see">🧭 Blind Spots{aiLocked ? ' 🔒' : ''}</button>
           {aiBlindSpots.length > 0 && (
