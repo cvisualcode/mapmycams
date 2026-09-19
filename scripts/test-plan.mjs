@@ -9,7 +9,7 @@
 //   bun run plan:test
 
 import {
-  PIXELS_PER_METER, segRayBlocked, computeBlindSpots, cameraSeesPoint, computeHealthScore, scoreBand, isPointInPolygon, objectCentre,
+  PIXELS_PER_METER, segRayBlocked, computeBlindSpots, cameraSeesPoint, computeHealthScore, scoreBand, isPointInPolygon, objectCentre, clickHitsWallShape,
 } from '../src/editor/plan-drawing.js'
 
 let failures = 0
@@ -96,6 +96,23 @@ check('each check names what it is', covered.checks.every((c) => typeof c.label 
 const band = scoreBand(covered.score)
 check('a band with a label and a tone is returned', typeof band?.label === 'string' && typeof band?.tone === 'string', JSON.stringify(band))
 check('the bands rise with the score', scoreBand(90).tone === 'good' && scoreBand(0).tone === 'bad', `${scoreBand(90).tone}/${scoreBand(0).tone}`)
+
+// ── Picking a room by its wall ───────────────────────────────────────────────
+// A room is picked by one of its walls, never by its floor — that is what leaves the
+// things standing inside a room selectable. The slack is in canvas pixels, so it feels
+// the same at every zoom.
+console.log('\nRoom picking')
+const atOrigin = { x: 0, y: 0 }
+const pick = (metresX, metresY, zoom = 1) => clickHitsWallShape({ x: m(metresX), y: m(metresY) }, hall.points, atOrigin, atOrigin, zoom)
+check('a click on a wall picks the room', pick(0, 3))
+check('a click on a corner picks the room', pick(0, 0) && pick(6, 6))
+check('a click just off the outside of a wall still picks it', pick(-0.05, 3))
+check('a click in the middle of the room picks nothing', !pick(3, 3))
+check('a click a metre short of the wall picks nothing', !pick(1, 3))
+check('a click well outside the house picks nothing', !pick(-5, 3))
+check('a wall picks only the room it belongs to', clickHitsWallShape({ x: m(10), y: m(3) }, kitchen.points, atOrigin, atOrigin, 1) && !clickHitsWallShape({ x: m(10), y: m(3) }, hall.points, atOrigin, atOrigin, 1))
+check('the slack is what you see, not what the plan is measured in', !pick(-0.4, 3, 1) && pick(-0.4, 3, 0.2))
+check('a shape with no line is not pickable', !clickHitsWallShape({ x: 0, y: 0 }, [{ x: 0, y: 0 }], atOrigin, atOrigin, 1))
 
 // ── Point in polygon ─────────────────────────────────────────────────────────
 console.log('\nGeometry')

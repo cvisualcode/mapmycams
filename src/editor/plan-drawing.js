@@ -728,6 +728,22 @@ export function findNearestWallSegment(world, walls, origin, pan, zoom, maxPx = 
   return best
 }
 
+/**
+ * Did a click land on this wall shape — near enough to its line to count as picking it?
+ *
+ * This is how a room is picked: by one of its walls, with a little slack either side,
+ * and never by its floor. A click in the middle of a room therefore picks nothing,
+ * which is what leaves everything standing in the room selectable; a click just
+ * outside the house still picks the room, because the outside face of a wall is a
+ * wall too. `slackPx` is deliberately small, so an outlet or a safe standing against
+ * a wall still wins its own click.
+ */
+export function clickHitsWallShape(world, points, origin, pan, zoom, slackPx = 9) {
+  if (!Array.isArray(points) || points.length < 2) return false
+  const shape = { id: 'shape', closed: true, points }
+  return findNearestWallSegment(world, [shape], origin, pan, zoom, slackPx) !== null
+}
+
 export function drawWindowOnWallSegment(ctx, x1, y1, x2, y2, origin, pan, zoom) {
   const start = toCanvas(x1, y1, origin, pan, zoom)
   const end = toCanvas(x2, y2, origin, pan, zoom)

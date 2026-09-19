@@ -38,7 +38,7 @@ import {
   drawWindowOnWallSegment,
   drawWall,
   computeBlindSpots,
-  isPointInPolygon,
+  clickHitsWallShape,
   drawObject,
   drawWire,
   convexHull,
@@ -59,6 +59,11 @@ let nextId = 1
 function useEntitlementsSafe() {
   try { return useEntitlements() } catch { return null }
 }
+
+// How close a click has to land to a room's wall, in canvas pixels, to select that
+// room. Loose enough that the line never needs hitting exactly; tight enough that an
+// outlet or a safe standing against the wall still wins the click for itself.
+const WALL_CLICK_PX = 9
 
 function App({ onExit, showUpgrade, initialSnapshot }) {
   const canvasRef = useRef(null)
@@ -719,6 +724,22 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     const p2 = wall.points[(hit.segmentIndex + 1) % wall.points.length]
     return { x: p1.x + (p2.x - p1.x) * hit.t, y: p1.y + (p2.y - p1.y) * hit.t }
   }
+
+  /**
+   * "Did this click pick this wall shape?"
+   *
+   * This is the test the click handler calls when it is about to select a room, and it
+   * means *the wall*, not the floor: the click has to land within WALL_CLICK_PX of one
+   * of the shape's lines. The name is the click handler's; the geometry and the slack
+   * live in clickHitsWallShape, beside the rest of the wall maths and its tests.
+   *
+   * Picking a room by its floor is what made everything standing in a room
+   * unselectable — any click inside it grabbed the whole room first.
+   */
+  function isPointInPolygon(x, y, polygon) {
+    return clickHitsWallShape({ x, y }, polygon, origin, pan, zoom, WALL_CLICK_PX)
+  }
+
   return (
     <div className="app">
       <div className="toolbar">
@@ -766,18 +787,21 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
             </>
           )}
           {mode === 'select' && !selectedCamera && !selectedObject && selectedRoom === null && (
-            <span className="hint">Tap a camera, object or room to select it</span>
+            <span className="hint">Tap a camera or an object to select it — tap a wall to select its room</span>
           )}
-          {mode === 'select' && selectedCamera && (
+          {/* Whatever is selected offers its own controls, in every mode: a door can be
+              picked up while the Objects tool is still armed, and it should still be
+              movable, rotatable and deletable from here. */}
+          {selectedCamera && (
             <button onClick={deleteSelected}>Delete Camera</button>
           )}
-          {mode === 'select' && selectedObject && (
+          {selectedObject && (
             <>
               <button onClick={rotateSelectedObject}>Rotate 90°</button>
               <button onClick={deleteSelected}>Delete Object</button>
             </>
           )}
-          {mode === 'select' && selectedRoom !== null && (
+          {selectedRoom !== null && (
             <button onClick={deleteSelectedRoom}>Delete Room</button>
           )}
           <button onClick={aiPlaceWithModel} disabled={aiBusy} title="Premium: AI-suggested camera positions">
