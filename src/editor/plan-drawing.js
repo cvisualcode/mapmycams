@@ -7,6 +7,10 @@
 //
 // src/App.jsx holds the editor component itself and imports from here.
 
+// Explicit extension: the node test scripts import this module directly, and they have
+// no bundler to resolve a bare specifier for them.
+import { roomDisplayName } from './room-names.js'
+
 // How the world is measured. A plan is stored in pixels and every real-world figure
 // — room sizes, camera throw, object dimensions — is converted with this one number,
 // so changing it rescales the whole tool and nothing drifts out of proportion.
@@ -551,7 +555,7 @@ export function drawSegmentMeasurement(ctx, p1, p2, origin, pan, zoom) {
   drawMeasurementLabel(ctx, formatMeasurement(worldLength / PIXELS_PER_METER), midX, midY, zoom)
 }
 
-export function drawRoomLabel(ctx, wall, origin, pan, zoom) {
+export function drawRoomLabel(ctx, wall, origin, pan, zoom, fallback = 'Room') {
   if (wall.points.length < 3) return
   let cx = 0, cy = 0
   for (const p of wall.points) {
@@ -565,7 +569,9 @@ export function drawRoomLabel(ctx, wall, origin, pan, zoom) {
   ctx.font = `${12 * zoom}px system-ui, sans-serif`
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
-  ctx.fillText(wall.label || 'Room', cx, cy)
+  // `fallback` is the room's positional name, so a plan that arrived without
+  // labels still prints "Room 2" rather than a bare "Room" in every room.
+  ctx.fillText(wall.label || fallback, cx, cy)
 }
 
 export function drawRectangle(ctx, x1, y1, x2, y2, zoom, widthMeters, heightMeters) {
@@ -906,7 +912,7 @@ export function computeBlindSpots(walls, cameras, objects) {
         if (!visible) cells.push({ x, y })
       }
     }
-    if (cells.length > 0) blind.push({ wall, label: wall.label || 'Room', cells, area: cells.length * (CELL / PIXELS_PER_METER) * (CELL / PIXELS_PER_METER) })
+    if (cells.length > 0) blind.push({ wall, label: roomDisplayName(wall, walls.indexOf(wall)), cells, area: cells.length * (CELL / PIXELS_PER_METER) * (CELL / PIXELS_PER_METER) })
   }
   return blind
 }

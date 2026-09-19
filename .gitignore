@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Local wrangler state (miniflare's KV and cache) — created by the kv commands
+# that read back what the deployed Worker wrote.
+.wrangler
+
 # Local secrets — never commit. .env holds RESEND_API_KEY and the Cloudflare
 # token; .dev.vars is wrangler's equivalent.
 .env

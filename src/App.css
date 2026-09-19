@@ -38,6 +38,13 @@
   border-color: #60a5fa;
 }
 
+/* Undo and Redo sit there greyed out until there is something to step to, so the
+   toolbar keeps its shape instead of reflowing on every edit. */
+.toolbar button:disabled {
+  opacity: .4;
+  cursor: default;
+}
+
 .toolbar label {
   display: inline-flex;
   gap: 6px;
@@ -54,6 +61,22 @@
   padding: 4px;
 }
 
+/* The room-name box beside Delete Room. Wide enough to type "Back bedroom" and
+   short enough that it does not push the rest of the toolbar off a laptop. */
+.toolbar .room-name input {
+  width: 150px;
+  background: #0f172a;
+  color: #f8fafc;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 13px;
+}
+.toolbar .room-name input:focus {
+  outline: 2px solid #60a5fa;
+  outline-offset: 1px;
+}
+
 .hint {
   font-size: 12px;
   color: #94a3b8;
@@ -66,6 +89,35 @@
   background: #f8fafc;
   border-top: 1px solid #e2e8f0;
   position: relative;
+}
+
+/* A finger on the canvas draws; it must not scroll or zoom the page. `touch-action:
+   none` is what makes that true — without it the browser takes the gesture for a
+   scroll and the plan never sees it. */
+.canvas-wrap .plan-canvas {
+  touch-action: none;
+  display: block;
+}
+.canvas-wrap {
+  overscroll-behavior: contain;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* On a phone or a narrow tablet the sidebar overlays the plan instead of squeezing the
+   canvas into a strip, and the floor switch stops wrapping onto a second row. The tab
+   strip still toggles it, so nothing is hidden that cannot be got back. */
+@media (max-width: 860px) {
+  .sidebar {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(310px, 86vw);
+    box-shadow: -18px 0 40px rgba(15, 23, 42, .18);
+    z-index: 5;
+  }
+  .workspace { position: relative; }
 }
 
 .canvas-wrap canvas {
@@ -513,6 +565,9 @@
 .auth-sub { color: #64748b; font-size: 13px; margin: 0 0 18px; }
 .auth-input { width: 100%; padding: 10px 12px; margin-bottom: 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; }
 .auth-error { background: #fef2f2; color: #b91c1c; font-size: 13px; padding: 8px 10px; border-radius: 8px; margin-bottom: 10px; }
+.auth-forgot { margin: -2px 0 12px; text-align: right; }
+.auth-forgot button { background: none; border: none; padding: 0; color: #2563eb; font-size: 13px; cursor: pointer; }
+.auth-forgot button:hover { text-decoration: underline; }
 .auth-warn { background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; font-size: 12px; line-height: 1.5; padding: 9px 11px; border-radius: 8px; margin-bottom: 12px; }
 .auth-warn code { background: rgba(120, 53, 15, .12); padding: 1px 4px; border-radius: 4px; font-size: 11px; }
 .auth-code { letter-spacing: 10px; text-align: center; font-size: 26px; font-weight: 700; padding: 14px 10px; text-indent: 10px; }

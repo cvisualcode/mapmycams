@@ -2,14 +2,16 @@
 // Mount as a Cloudflare Worker module or Node serverless catch-all.
 // Routes:
 //   POST /auth/signup | /auth/verify | /auth/resend | /auth/login | /auth/logout
+//   POST /auth/reset-request | /auth/reset-confirm  (forgotten password)
 //   POST /auth/send-code  (mailer only — for browsers with no server session)
 //   GET  /me
 //   GET/POST/DELETE /floorplans(/:id)
 //   POST /billing/checkout | /billing/confirm | /billing/portal | /billing/cancel | /billing/invoices
 //   POST /webhooks/stripe
 //   POST /ai/suggest  (rate-limited, premium only)
-//   POST /analytics
-//   GET  /admin/users | POST /admin/set-plan | POST /admin/flag
+//   POST /analytics  (counted per day for the visitor journey)
+//   POST /report-error  (uncaught errors from a visitor's browser)
+//   GET  /admin/users | /admin/stats | POST /admin/set-plan | /admin/flag
 //
 // Accounts, floorplans and flags live in Cloudflare KV (api/_lib.js). Passwords
 // arrive already stretched by the browser, so this process never sees one.
@@ -19,9 +21,9 @@ import {
   getUser, listUsers, saveUser, listFloorplans, saveFloorplan, deleteFloorplan, setFlag,
   stripeCheckoutSession, stripeGetSession, stripeListInvoices,
   stripePortalSession, verifyStripeSignature, stripeConfigured,
-  generateVerificationCode, hashCode, verifyCode, credentialProblem, sendVerificationEmail,
+  generateVerificationCode, hashCode, verifyCode, credentialProblem, sendVerificationEmail, sendResetEmail,
   emailConfigured, resendCooldownRemaining, CODE_TTL_MS, CODE_MAX_ATTEMPTS,
-  json, cors, rateLimit,
+  json, cors, rateLimit, readJson, writeJson,
 } from './_lib.js'
 import { suggestSpotsWithModel, PIXELS_PER_METER } from './ai.js'
 
@@ -75,13 +77,110 @@ function mailerOriginAllowed(request) {
   return Boolean(origin) && MAILER_ORIGIN.test(origin)
 }
 
-/** The signed-in account, or null. */
+// ── What visitors do, and what breaks for them ───────────────────────────────
+// Both live in the same store as the accounts, keyed so a day of numbers is one
+// record and the whole error list is another. Two rules keep them from ever costing
+// more than they are worth: the day's counting stops at a ceiling, and one error
+// signature is written at most once every few minutes.
+
+/**
+ * The events that describe a visitor's journey, and the only ones stored server-side.
+ *
+ * An event name is free text from an unauthenticated caller, so this is a set rather
+ * than a namespace: anything else is acknowledged and dropped.
+ */
+const FUNNEL_EVENTS = new Set([
+  'landing_view', 'landing_cta', 'auth_view', 'signup_started', 'email_verified',
+  'login_success', 'login_blocked_unverified', 'password_reset_requested',
+  'password_reset_done', 'checkout_started', 'checkout_redirected',
+  'checkout_completed', 'upsell_shown', 'subscription_canceled',
+  'floorplan_saved', 'ai_suggest',
+])
+
+/** A day's counting stops here, so a flood cannot spend the sign-in write budget. */
+const FUNNEL_DAY_CEILING = 2000
+
+/** Where the error list lives, how long it may get, and how often it may be written. */
+const ERROR_LIST_KEY = 'errors:recent'
+const ERROR_LIST_MAX = 40
+const ERROR_WRITE_INTERVAL_MS = 5 * 60 * 1000
+
+const utcDay = (offsetDays = 0) => new Date(Date.now() - offsetDays * 86400000).toISOString().slice(0, 10)
+
+/** Add one to today's count for an event. False when the day's ceiling was reached. */
+async function countFunnelEvent(event) {
+  const key = `stats:${utcDay()}`
+  const counts = (await readJson(key)) || {}
+  const total = Object.values(counts).reduce((sum, n) => sum + (Number(n) || 0), 0)
+  if (total >= FUNNEL_DAY_CEILING) return false
+  counts[event] = (counts[event] || 0) + 1
+  await writeJson(key, counts)
+  return true
+}
+
+/**
+ * A stable name for an error, so the same crash is one entry and not two hundred.
+ *
+ * Digits come out first: "Cannot read properties of null (reading 'id') at 47" and the
+ * same line at 82 are the same bug, and a counter that says so is worth reading.
+ */
+async function errorSignature(message) {
+  const normalised = message.toLowerCase().replace(/\d+/g, '#')
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalised))
+  return [...new Uint8Array(digest)].slice(0, 8).map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** Keep the most recently seen, so an old bug cannot crowd out a new one. */
+function pruneErrors(list) {
+  const entries = Object.entries(list)
+  if (entries.length <= ERROR_LIST_MAX) return list
+  return Object.fromEntries(entries
+    .sort((a, b) => String(b[1].lastSeen).localeCompare(String(a[1].lastSeen)))
+    .slice(0, ERROR_LIST_MAX))
+}
+
+/** Record one uncaught error from a browser. False when it was throttled. */
+async function recordClientError(report) {
+  const message = String(report?.message || '').slice(0, 300)
+  if (!message) return false
+  const signature = await errorSignature(message)
+  const list = (await readJson(ERROR_LIST_KEY)) || {}
+  const existing = list[signature]
+  const now = Date.now()
+  // One write per signature per few minutes: a page that throws on every frame would
+  // otherwise spend the store on a single visitor. The count is therefore approximate;
+  // the first and last sightings are exact, which is what a bug hunt needs.
+  if (existing && now - (existing.lastWrite || 0) < ERROR_WRITE_INTERVAL_MS) return false
+  const seen = new Date().toISOString()
+  await writeJson(ERROR_LIST_KEY, pruneErrors({
+    ...list,
+    [signature]: {
+      message,
+      count: (existing?.count || 0) + 1,
+      firstSeen: existing?.firstSeen || seen,
+      lastSeen: seen,
+      lastWrite: now,
+      where: String(report?.path || '').slice(0, 200),
+      agent: String(report?.userAgent || '').slice(0, 200),
+      stack: String(report?.stack || '').slice(0, 1000),
+    },
+  }))
+  return true
+}
+
+/**
+ * The signed-in account, or null.
+ *
+ * A token carries the password version it was issued against, so a session from
+ * before a password reset is refused rather than staying valid for its full 30 days.
+ */
 async function authUser(request) {
   const token = (request.headers.get('Authorization') || '').replace('Bearer ', '')
   const claims = token && await verifyToken(token)
   if (!claims) return null
   const user = await getUser(claims.email)
-  return user && user.id === claims.id ? user : null
+  if (!user || user.id !== claims.id) return null
+  return (user.password_version || 0) === (claims.pv || 0) ? user : null
 }
 
 /** Look an account up by id as well as email — admin and webhook callers use ids. */
@@ -114,6 +213,17 @@ async function deliverCode(email, code) {
   if (!emailConfigured()) return { sent: false, devCode: code }
   try {
     await sendVerificationEmail(email, code)
+    return { sent: true }
+  } catch (err) {
+    return { sent: false, deliveryError: err.message, devCode: code }
+  }
+}
+
+/** Send a password-reset code. `devCode` only when no provider is configured. */
+async function deliverReset(email, code) {
+  if (!emailConfigured()) return { sent: false, devCode: code }
+  try {
+    await sendResetEmail(email, code)
     return { sent: true }
   } catch (err) {
     return { sent: false, deliveryError: err.message, devCode: code }
@@ -204,12 +314,15 @@ async function handle(request, env) {
     if (!mailerOriginAllowed(request)) return json({ sent: false, error: 'Origin not allowed' }, 403)
     const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('x-forwarded-for') || 'unknown'
     if (!rateLimit(`mail:${ip}`, 5)) return json({ sent: false, error: 'Too many codes requested — try again in a minute' }, 429)
-    const { email, code, name } = await request.json().catch(() => ({}))
+    const { email, code, name, kind } = await request.json().catch(() => ({}))
     const to = String(email || '').trim().toLowerCase()
     if (!/^\S+@\S+\.\S+$/.test(to)) return json({ sent: false, error: 'A valid email address is required' }, 400)
     if (!/^\d{6}$/.test(String(code || ''))) return json({ sent: false, error: 'A 6-digit code is required' }, 400)
     try {
-      await sendVerificationEmail(to, String(code), name)
+      // `kind: 'reset'` picks the reset wording, so a browser that keeps its accounts
+      // locally gets the same email a server-side account would.
+      const send = kind === 'reset' ? sendResetEmail : sendVerificationEmail
+      await send(to, String(code), name)
       return json({ sent: true })
     } catch (err) {
       return json({ sent: false, error: err.message }, 502)
@@ -226,6 +339,69 @@ async function handle(request, env) {
     const wait = resendCooldownRemaining(user.verification_sent_at)
     if (wait > 0) return json({ error: `Please wait ${wait}s before requesting another code` }, 429)
     return json({ pendingVerification: true, email: id, ...(await issueCode(user)) })
+  }
+
+  // ── Forgotten password ─────────────────────────────────────────────────────
+  // Asking for a reset answers the same way whether or not there is an account
+  // behind the address, so the form cannot be used to find out who is registered.
+  // The account is untouched until the emailed code comes back.
+  if (path === '/auth/reset-request' && method === 'POST') {
+    const body = await request.json().catch(() => ({}))
+    const id = String(body.email || '').trim().toLowerCase()
+    if (!/^\S+@\S+\.\S+$/.test(id)) return json({ error: 'Enter a valid email address' }, 400)
+    const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('x-forwarded-for') || 'unknown'
+    if (!rateLimit(`reset:${ip}`, 5)) return json({ error: 'Too many reset requests — try again in a minute' }, 429)
+    const user = await getUser(id)
+    // Nothing to reset, so say nothing about it: the answer is the one an address with
+    // an account gets, down to the fields. Anything else — a missing `sent`, a
+    // cooldown, a delivery error — is a way to ask "is this address registered?"
+    // one POST at a time.
+    if (!user) return json({ ok: true, email: id, sent: true })
+    if (resendCooldownRemaining(user.reset_sent_at) > 0) return json({ ok: true, email: id, sent: true })
+    const code = generateVerificationCode()
+    await saveUser({
+      email: id,
+      reset_code_hash: await hashCode(code),
+      reset_expires: new Date(Date.now() + CODE_TTL_MS).toISOString(),
+      reset_attempts: 0,
+      reset_sent_at: new Date().toISOString(),
+    })
+    return json({ ok: true, email: id, ...(await deliverReset(id, code)) })
+  }
+
+  // Finish a reset. The code proves the address and the new password is set with it,
+  // after which every session issued against the old password stops working.
+  if (path === '/auth/reset-confirm' && method === 'POST') {
+    const body = await request.json().catch(() => ({}))
+    const id = String(body.email || '').trim().toLowerCase()
+    const problem = credentialProblem(body.credential)
+    if (problem) return json({ error: problem }, 400)
+    const user = await getUser(id)
+    if (!user) return json({ error: 'That code is not correct' }, 400)
+    if (!user.reset_code_hash) return json({ error: 'That code is no longer valid — request a new one' }, 400)
+    if (new Date(user.reset_expires).getTime() < Date.now()) return json({ error: 'That code has expired — request a new one' }, 400)
+    const attempts = user.reset_attempts || 0
+    if (attempts >= CODE_MAX_ATTEMPTS) return json({ error: 'Too many incorrect codes — request a new one' }, 429)
+    if (!(await verifyCode(body.code, user.reset_code_hash))) {
+      await saveUser({ email: id, reset_attempts: attempts + 1 })
+      return json({ error: `That code is not correct. ${CODE_MAX_ATTEMPTS - attempts - 1} attempt(s) left.` }, 400)
+    }
+    const updated = await saveUser({
+      email: id,
+      password_hash: await hashPassword(body.credential),
+      password_version: (user.password_version || 0) + 1,
+      reset_code_hash: null,
+      reset_expires: null,
+      reset_attempts: 0,
+      reset_sent_at: null,
+      // The code arrived at this address, so it is proven either way — which also
+      // rescues an account that was created but never finished verifying.
+      email_verified: true,
+      verification_code_hash: null,
+      verification_expires: null,
+      verification_attempts: 0,
+    })
+    return json({ token: await signToken(updated), user: publicRow(updated) })
   }
 
   if (path === '/auth/login' && method === 'POST') {
@@ -411,13 +587,31 @@ async function handle(request, env) {
   }
 
   // ── Analytics ──────────────────────────────────────────────────────────────
-  // Accepted and acknowledged but not stored: the browser keeps its own event log
-  // for the admin panel, and nothing unauthenticated gets to spend the KV write
-  // budget that sign-in needs.
+  // The browser keeps its own event log for the admin panel; counting the journey
+  // events here is what makes the numbers cover *every* visitor instead of the one
+  // person looking at the panel. Only the allow-listed names are counted, and always
+  // as a per-day total, so a caller cannot turn this into a write amplifier.
   if (path === '/analytics' && method === 'POST') {
     const { event } = await request.json().catch(() => ({}))
     if (typeof event !== 'string' || !event) return json({ error: 'An event name is required' }, 400)
-    return json({ ok: true })
+    const counted = FUNNEL_EVENTS.has(event) ? await countFunnelEvent(event).catch(() => false) : false
+    return json({ ok: true, counted })
+  }
+
+  // ── Client errors ──────────────────────────────────────────────────────────
+  // An uncaught error in a visitor's browser is otherwise invisible: it reaches the
+  // console of somebody you will never hear from. Unauthenticated on purpose — the
+  // errors that matter happen on the sign-in screen too — so it is rate limited by
+  // address, and one signature is written at most every few minutes.
+  if (path === '/report-error' && method === 'POST') {
+    const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('x-forwarded-for') || 'unknown'
+    if (!rateLimit(`err:${ip}`, 20)) return json({ ok: false }, 429)
+    const body = await request.json().catch(() => ({}))
+    // The server's own log comes first, so a report is visible in `wrangler tail`
+    // and the dashboard even if the store is unreachable.
+    console.error('[client-error]', JSON.stringify({ message: body?.message, where: body?.path }).slice(0, 600))
+    const stored = await recordClientError(body).catch(() => false)
+    return json({ ok: true, stored })
   }
 
   // ── Admin ──────────────────────────────────────────────────────────────────
@@ -429,6 +623,22 @@ async function handle(request, env) {
       id: row.id, email: row.email, name: row.name, plan: row.plan,
       addons: row.addons || [], isAdmin: !!row.is_admin, createdAt: row.created_at,
     })))
+  }
+  // What every visitor did, and what broke for them. The admin panel is the only
+  // reader; there is no public route to either number.
+  if (path === '/admin/stats' && method === 'GET') {
+    const admin = await authUser(request)
+    if (!admin) return json({ error: 'Unauthorised' }, 401)
+    if (!admin.is_admin) return json({ error: 'Forbidden' }, 403)
+    const funnel = {}
+    for (let i = 0; i < 7; i++) {
+      const day = utcDay(i)
+      const counts = await readJson(`stats:${day}`)
+      if (counts) funnel[day] = counts
+    }
+    const errors = Object.values((await readJson(ERROR_LIST_KEY)) || {})
+      .sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen)))
+    return json({ funnel, errors, ceiling: FUNNEL_DAY_CEILING })
   }
   if (path === '/admin/set-plan' && method === 'POST') {
     const admin = await authUser(request)

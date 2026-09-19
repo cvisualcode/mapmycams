@@ -466,6 +466,37 @@ the code screen shows the code with a notice explaining why. The notice names th
 actual failure (mailer missing, domain unverified, bad key), so it never fails
 silently.
 
+### Forgotten password
+
+A forgotten password used to mean a lost account — and a lost purchase with it.
+There is now a reset flow, reachable from **Forgot your password?** on the sign-in
+form, in both server and browser-local mode.
+
+| Step | Route | Behaviour |
+|---|---|---|
+| 1 | `POST /auth/reset-request` | Emails a 6-digit code. The reply is identical whether or not the address has an account — same fields, same values — so this cannot be used to ask "is this email registered?" one POST at a time |
+| 2 | `POST /auth/reset-confirm` | Takes the code and the new password; sets it, proves the address, and returns a session |
+
+| Rule | Value |
+|---|---|
+| Nothing changes before the code comes back | The password is untouched until step 2, so an unwanted request is harmless |
+| Code lifetime | 10 minutes, same as a verification code |
+| Wrong attempts | 5, then a new code is required |
+| Resend | One per 60 seconds |
+| Replay | The code is cleared on use and cannot be used twice |
+| Old sessions | A reset bumps the account's `password_version`; every token issued before it is refused, so anyone already signed in elsewhere is signed out |
+| Half-registered accounts | A completed reset also marks the address verified, so an account that never finished signing up can be rescued |
+| Rate limit | 5 reset requests per address per minute |
+| Session revocation scope | Only on password change. A token's 30-day life is otherwise unchanged |
+
+The reset email uses its own template (`passwordResetEmail` in `api/email-template.js`)
+— "verify your email" is the wrong thing to read when what you asked for was a new
+password — and it is delivered through the same Resend transport as the sign-in code.
+
+```
+bun run reset:test        # 40 checks: browser module → real Worker handler, memory KV, Resend caught
+```
+
 ### Password rules
 
 Enforced in `api.passwordProblem()` and mirrored by the checklist in the UI:
@@ -479,6 +510,43 @@ Enforced in `api.passwordProblem()` and mirrored by the checklist in the UI:
 `Admin` / `Admin1` — full access to every feature plus the admin panel. It is a
 seeded row in the local store and signs in through the normal form.
 
+## Visibility (what happens to other people)
+
+The admin panel used to show only the events in **this browser's** log, which is the
+one browser the person reading it is not using. Two additions close that gap.
+
+### Counted visitor journey
+
+`POST /analytics` now counts the events that describe the journey, as a per-day total
+in the same KV store as the accounts. Anything not on the list — an event name is
+free text from an unauthenticated caller — is acknowledged and dropped.
+
+| | |
+|---|---|
+| Counted | `landing_view`, `landing_cta`, `auth_view`, `signup_started`, `email_verified`, `login_success`, `login_blocked_unverified`, `password_reset_requested`, `password_reset_done`, `checkout_started`, `checkout_redirected`, `checkout_completed`, `upsell_shown`, `subscription_canceled`, `floorplan_saved`, `ai_suggest` |
+| Stored as | `stats:<YYYY-MM-DD>` — one record per day, one read and one write per event |
+| Ceiling | Counting for a day stops at 2,000 events, so a flood cannot spend the write budget sign-in needs |
+| Read by | `GET /admin/stats` (admin only) and the **All visitors · last 7 days** card in the admin panel |
+
+### Uncaught errors from a visitor's browser
+
+`src/monetisation/errors.js` listens for `error` and `unhandledrejection` and posts to
+`POST /report-error`, which logs the report (visible in `wrangler tail` and the
+Cloudflare dashboard) and keeps a counted list at `errors:recent` for the admin panel.
+
+| Rule | Value |
+|---|---|
+| Per page load | At most 6 reports, and never the same message twice |
+| Grouping | Digits are stripped before signing, so "failed at 4711" and "failed at 9912" are one entry |
+| Write throttle | One write per signature per 5 minutes — the count is therefore approximate, the first and last sightings exact |
+| List length | 40 entries, oldest dropped |
+| Resource errors | An image that failed to load is not reported as a crash |
+| Rate limit | 20 reports per address per minute |
+
+```
+bun run visibility:test   # 30 checks: counting, ceiling, error grouping, throttling, admin gate
+```
+
 ## Security & GDPR
 
 - **Passwords are never stored, and in server mode never even sent.** The
@@ -490,6 +558,14 @@ seeded row in the local store and signs in through the normal form.
   shaped like a client hash of at least 100,000 iterations, so it cannot be talked
   into storing something cheap. Local-mode hashes from older builds are upgraded
   on the next sign-in.
+- **A password change retires the old sessions.** A token carries a `pv` claim (the
+  password version it was issued against); a reset bumps the account's version, and
+  `authUser()` refuses a token whose claim no longer matches. Tokens issued before
+  this existed carry no claim and are treated as version 0, so nobody was signed out
+  by the change itself.
+- **Reset requests cannot be used to enumerate accounts.** The reply to
+  `/auth/reset-request` has the same fields and the same values whether or not the
+  address is registered, and it is rate limited per address.
 - **Session tokens are signed, not random.** A 30-day HS256 JWT carrying the
   account id and email, verified on every request; a token for a deleted or
   unverified account is rejected. (`api/_lib.js` decodes the signature to bytes

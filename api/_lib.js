@@ -8,7 +8,7 @@
 //   AUTH_SECRET       (secret)  — signs session tokens and keys password hashes
 //   MAPMYCAMS_STORE   (binding) — the KV namespace holding accounts, plans, flags
 
-import { verificationEmail } from './email-template.js'
+import { verificationEmail, passwordResetEmail } from './email-template.js'
 
 const AUTH_SECRET = () => globalThis.env?.AUTH_SECRET
 const store = () => globalThis.env?.MAPMYCAMS_STORE
@@ -60,6 +60,11 @@ export async function signToken(user, days = 30) {
   const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
   const payload = b64url(JSON.stringify({
     sub: user.id, email: user.email, exp: Math.floor(Date.now() / 1000) + days * 86400,
+    // Which password this session was issued against. Changing the password bumps the
+    // account's version, which retires every token minted before it — without that, a
+    // reset would leave whoever already had the account signed in still signed in.
+    // Absent means 0, so tokens issued before this existed keep working.
+    pv: user.password_version || 0,
   }))
   const key = await hmacKey(AUTH_SECRET())
   const sig = b64url(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${header}.${payload}`)))
@@ -76,7 +81,9 @@ export async function verifyToken(token) {
     if (!ok) return null
     const payload = JSON.parse(b64url(p, true))
     if (payload.exp * 1000 < Date.now()) return null
-    return payload.sub && payload.email ? { id: payload.sub, email: payload.email } : null
+    return payload.sub && payload.email
+      ? { id: payload.sub, email: payload.email, pv: payload.pv || 0 }
+      : null
   } catch { return null }
 }
 
@@ -169,7 +176,7 @@ export const emailConfigured = () => Boolean(globalThis.env?.RESEND_API_KEY)
  * Send the 6-digit code with Resend's REST API (no SDK, one POST).
  * Throws when delivery is not configured — callers decide how to degrade.
  */
-export async function sendVerificationEmail(email, code, name = '') {
+async function sendCodeEmail(email, template) {
   const apiKey = globalThis.env?.RESEND_API_KEY
   if (!apiKey) throw new Error('Email delivery is not configured (RESEND_API_KEY missing)')
   // No fallback sender on purpose: Resend's onboarding@resend.dev address can
@@ -179,10 +186,19 @@ export async function sendVerificationEmail(email, code, name = '') {
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from, to: [email], ...verificationEmail(code, name) }),
+    body: JSON.stringify({ from, to: [email], ...template }),
   })
   if (!res.ok) throw new Error(`Resend ${res.status}: ${await res.text()}`)
   return res.json()
+}
+
+export async function sendVerificationEmail(email, code, name = '') {
+  return sendCodeEmail(email, verificationEmail(code, name))
+}
+
+/** The same delivery, carrying the password-reset wording. */
+export async function sendResetEmail(email, code, name = '') {
+  return sendCodeEmail(email, passwordResetEmail(code, name))
 }
 
 // ── Accounts (Cloudflare KV) ─────────────────────────────────────────────────
@@ -248,6 +264,24 @@ export async function deleteFloorplan(ownerId, id) {
 }
 
 // ── Feature flags ────────────────────────────────────────────────────────────
+
+/**
+ * Read and write a plain JSON record.
+ *
+ * Accounts and floorplans have shapes of their own; the funnel counters and the
+ * client-error list do not, and they belong in the same store rather than in a second
+ * one. Both are read only by the admin panel.
+ */
+export async function readJson(key) {
+  requireConfig()
+  return (await store().get(key, 'json')) || null
+}
+
+export async function writeJson(key, value) {
+  requireConfig()
+  await store().put(key, JSON.stringify(value))
+  return value
+}
 
 export async function setFlag(key, enabled) {
   requireConfig()

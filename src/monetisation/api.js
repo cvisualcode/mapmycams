@@ -432,12 +432,14 @@ export function track(event, props = {}) {
     if (a.events.length > 2000) a.events = a.events.slice(-1000)
     saveAnalytics(a)
   } catch { /* analytics must never break the app */ }
-  if (API_URL) {
-    fetch(`${API_URL}/analytics`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event, props }),
-    }).catch(() => {})
-  }
+  // Sent to the API as well as kept here, so the funnel counts every visitor rather
+  // than only the one whose browser this is. Relative when there is no VITE_API_URL:
+  // on a static host that is a 404 the promise swallows, and on the Worker it is the
+  // route that counts the event (see FUNNEL_EVENTS in api/index.js).
+  fetch(`${API_URL}/analytics`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ event, props }),
+  }).catch(() => {})
 }
 
 // ─── Live backend calls (used only when VITE_API_URL is set) ─────────────────
@@ -494,12 +496,12 @@ async function apiRaw(path, body) {
  * configured yet, the caller shows the code on screen instead of failing.
  * Returns { sent: true } or { sent: false, deliveryError }.
  */
-async function requestVerificationEmail(email, code, name = '') {
+async function requestVerificationEmail(email, code, name = '', kind = 'verify') {
   try {
     const res = await fetch(MAILER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, code, name }),
+      body: JSON.stringify({ email, code, name, kind }),
     })
     const data = await res.json().catch(() => ({}))
     if (res.ok && data.sent) return { sent: true }
@@ -795,6 +797,101 @@ export async function resendCode(email) {
   }
 }
 
+// ─── Forgotten password ──────────────────────────────────────────────────────
+// The same split as signing in: the account service handles an account that lives
+// there, and this browser handles one that only ever existed here. Requesting a
+// reset answers identically for an address with no account, so neither route can
+// be used to find out who is registered, and nothing is changed until the emailed
+// code comes back.
+
+/** Start a reset. Returns { ok, email, sent, deliveryError, devCode?, wait? }. */
+export async function requestPasswordReset(email) {
+  const id = String(email || '').trim().toLowerCase()
+  if (!id || !/^\S+@\S+\.\S+$/.test(id)) throw new Error('Enter a valid email address')
+
+  const live = await apiRaw('/auth/reset-request', { email: id })
+  if (live.server) {
+    if (!live.ok) throw new Error(live.data.error || 'Could not start the reset')
+    track('password_reset_requested', { identifier: id })
+    return { ...live.data, email: id }
+  }
+
+  const db = loadDB()
+  const user = findUser(db, id)
+  // The same answer an address with an account gets, so the shape of the reply never
+  // gives away whether there is an account behind it here either.
+  if (!user) return { ok: true, email: id, sent: true }
+  const waitMs = RESEND_COOLDOWN_MS - (Date.now() - (user.reset?.sentAt || 0))
+  if (waitMs > 0) return { ok: true, email: id, sent: true }
+  const code = generateCode()
+  user.reset = {
+    codeHash: await hashPassword(code),
+    expires: Date.now() + CODE_TTL_MS,
+    attempts: 0,
+    sentAt: Date.now(),
+  }
+  saveDB(db)
+  track('password_reset_requested', { identifier: id })
+  const delivery = await requestVerificationEmail(id, code, user.name, 'reset')
+  return {
+    ok: true, email: id, sent: delivery.sent,
+    deliveryError: delivery.deliveryError,
+    devCode: delivery.sent ? undefined : code,
+  }
+}
+
+/**
+ * Finish a reset with the code and a new password. On success the caller is signed
+ * in: the code proves the address, so there is nothing left to prove.
+ */
+export async function confirmPasswordReset(email, code, password) {
+  const id = String(email || '').trim().toLowerCase()
+  const clean = String(code || '').trim()
+  if (!/^\d{6}$/.test(clean)) throw new Error('Enter the 6-digit code from the email')
+  const problem = passwordProblem(password)
+  if (problem) throw new Error(problem)
+
+  const live = await apiRaw('/auth/reset-confirm', {
+    email: id, code: clean, credential: await wireCredential(id, password),
+  })
+  if (live.server) {
+    if (!live.ok) throw new Error(live.data.error || 'That code is not correct')
+    setServerToken(live.data.token)
+    track('password_reset_done', { identifier: id })
+    return live.data.user
+  }
+
+  const db = loadDB()
+  const user = findUser(db, id)
+  if (!user) throw new Error('That code is not correct')
+  const reset = user.reset
+  if (!reset) throw new Error('That code is no longer valid — request a new one')
+  if (reset.expires < Date.now()) throw new Error('That code has expired — request a new one')
+  if (reset.attempts >= CODE_MAX_ATTEMPTS) throw new Error('Too many incorrect codes — request a new one')
+
+  const { ok } = await verifyPassword(clean, reset.codeHash)
+  if (!ok) {
+    reset.attempts += 1
+    saveDB(db)
+    const left = CODE_MAX_ATTEMPTS - reset.attempts
+    if (left <= 0) throw new Error('Too many incorrect codes — request a new one')
+    throw new Error(`That code is not correct. ${left} attempt${left === 1 ? '' : 's'} left.`)
+  }
+
+  user.passHash = await hashPassword(password)
+  // The code arrived at this address, so it is proven either way — which also
+  // rescues an account that was created here but never finished verifying.
+  user.emailVerified = true
+  delete user.verification
+  delete user.reset
+  saveDB(db)
+  clearFailures(db, user.id)
+  startSession(user.id)
+  cancelPendingVerification()
+  track('password_reset_done', { identifier: user.identifier })
+  return publicUser(user)
+}
+
 export async function logout() {
   try { await api('/auth/logout', {}) } catch { /* local mode */ }
   setServerToken(null)
@@ -1051,6 +1148,15 @@ export async function deleteFloorplan(id) {
 }
 
 // ─── Admin operations ────────────────────────────────────────────────────────
+
+/**
+ * What everyone did over the last week, and the errors they hit. Admin only: the
+ * route refuses anyone else, and there is no client-side copy of these numbers.
+ */
+export async function adminStats() {
+  try { return await api('/admin/stats', null, 'GET') } catch (e) { if (e.message !== 'demo') throw e }
+  return null
+}
 
 export async function adminListUsers() {
   try { return await api('/admin/users', null, 'GET') } catch (e) { if (e.message !== 'demo') throw e }

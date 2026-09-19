@@ -23,6 +23,11 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Test
+        # Every suite runs as a plain node script, so this needs nothing installed
+        # beyond the dependencies above.
+        run: npm test
+
       - name: Build app
         # The accounts API is served by the Worker on the custom domain, so the
         # Pages build points at it rather than keeping a second, browser-local

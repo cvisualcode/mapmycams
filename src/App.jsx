@@ -8,6 +8,13 @@ import { useEntitlements } from './monetisation/EntitlementsContext'
 import { planShareUrl } from './monetisation/share'
 import * as api from './monetisation/api'
 import { planCameraPlacement } from './editor/coverage-plan'
+import { MAX_ROOM_NAME, ensureRoomLabels, normalizeRoomName, renameRoom, roomDisplayName } from './editor/room-names'
+import { createHistory, deserializePlan, serializePlan } from './editor/history'
+import {
+  createGestureTracker, pointerDown, pointerMove, pointerUp, pointerCancel,
+  beginPinch, pinchTransform, trackedPoints,
+} from './editor/pointer-gestures'
+import { duplicateCamera, duplicateObject } from './editor/duplicate'
 import './App.css'
 import {
   PIXELS_PER_METER,
@@ -275,6 +282,385 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     setSelectedObject({ ...selectedDoor, hingeSide: side })
   }
 
+  /**
+   * Name the room that is selected. The name lives on the wall as `label`, which is what
+   * the canvas label, the blind-spot list and the PDF report all print — so naming a room
+   * once improves all three. A blank name goes back to its position rather than leaving
+   * the room nameless. Defined here rather than beside the other deletes so it sits with
+   * the rest of the room logic; function declarations hoist, so the toolbar can call it.
+   */
+  function renameSelectedRoom(name) {
+    if (selectedRoom === null) return
+    setWalls((prev) => renameRoom(prev, selectedRoom, name))
+  }
+
+  // ── Undo / redo ──
+  // The plan is observed rather than hooked: the mutations are spread across the whole
+  // editor, so every time the plan settles it is serialized and offered to the timeline
+  // in src/editor/history.js, which keeps it unless it is identical to what it holds.
+  // Waiting for it to settle is what makes a drag one undo step instead of fifty — and
+  // stepping back commits whatever is still inside that window first, so an undo pressed
+  // straight after an edit still finds it.
+  const historyRef = useRef(null)
+  if (!historyRef.current) historyRef.current = createHistory()
+  const historyTimerRef = useRef(null)
+  const latestPlanRef = useRef(null)
+  const [historyFlags, setHistoryFlags] = useState({ canUndo: false, canRedo: false })
+
+  /** Every floor, as one string. What an undo step actually restores. */
+  function planSnapshotNow() {
+    return serializePlan({ floors: planFloors(), activeFloor })
+  }
+
+  function setHistoryFlagsFor(canUndo, canRedo) {
+    setHistoryFlags((prev) => (prev.canUndo === canUndo && prev.canRedo === canRedo ? prev : { canUndo, canRedo }))
+  }
+
+  /** Store the plan as it stands, cancelling any pending settle first. */
+  function commitHistory() {
+    if (historyTimerRef.current) {
+      clearTimeout(historyTimerRef.current)
+      historyTimerRef.current = null
+    }
+    if (historyRef.current.record(planSnapshotNow())) {
+      setHistoryFlagsFor(historyRef.current.canUndo(), historyRef.current.canRedo())
+    }
+  }
+
+  /** Put a snapshot back on screen. Nothing half-finished survives a restore. */
+  function applyPlan(plan) {
+    setDrag(null)
+    setRotateDrag(false)
+    setResizing(null)
+    setPlacingCamera(null)
+    setPlacingObject(null)
+    setWindowDrag(null)
+    setCurrentWall(null)
+    setCurrentWire(null)
+    setWireSnap(null)
+    setRectStart(null)
+    setRectEnd(null)
+    setHoveredPoint(null)
+    setShowObjectPanel(false)
+    setSelectedCamera(null)
+    setSelectedObject(null)
+    setSelectedRoom(null)
+    // The floors that are not on screen come from the snapshot too, so undoing after a
+    // floor switch puts every floor back rather than only the one you can see.
+    floorsRef.current = {}
+    plan.floors.forEach((floor, i) => {
+      if (i === plan.activeFloor) return
+      floorsRef.current[i] = { walls: floor.walls, cameras: floor.cameras, objects: floor.objects, wires: floor.wires }
+    })
+    const active = plan.floors[plan.activeFloor] || { walls: [], cameras: [], objects: [], wires: [] }
+    setActiveFloor(plan.activeFloor)
+    setWalls(active.walls)
+    setCameras(active.cameras)
+    setObjects(active.objects)
+    setWires(active.wires)
+  }
+
+  function undoPlan() {
+    commitHistory()
+    const previous = historyRef.current.undo()
+    if (previous) applyPlan(deserializePlan(previous))
+    setHistoryFlagsFor(historyRef.current.canUndo(), historyRef.current.canRedo())
+  }
+
+  function redoPlan() {
+    // Storing the plan first is also what ends the redo trail if an edit happened after
+    // the undo: you cannot redo into a plan that has since moved somewhere else.
+    commitHistory()
+    const next = historyRef.current.redo()
+    if (next) applyPlan(deserializePlan(next))
+    setHistoryFlagsFor(historyRef.current.canUndo(), historyRef.current.canRedo())
+  }
+
+  // ── Touch and pen ──
+  // The canvas used to listen for mouse events only, so on a tablet nothing could be
+  // drawn at all — a finger dragged the page around instead. Pointer events cover a
+  // finger, a stylus and a mouse with one set of handlers, which is why they *replace*
+  // the mouse ones rather than sitting beside them (a tap would otherwise be handled
+  // twice).
+  //
+  // A finger differs from a mouse in two ways the editor has to respect:
+  //
+  //  * A tap cannot become a click the instant it lands, because a second finger may be
+  //    on its way and that is a pinch, not a placement. So the press waits for either a
+  //    few pixels of travel or a lift, and a second finger throws it away.
+  //  * Two fingers are a pinch: zoom about the point between them, and the same gesture
+  //    pans the plan. Starting one abandons whatever the first finger was midway
+  //    through — a half-drawn wall is safe to drop, which is why nothing is committed
+  //    until a gesture ends.
+  // What a press *means* is decided in src/editor/pointer-gestures.js, which is plain
+  // functions and therefore testable; these handlers only carry the answer out.
+  const touchRef = useRef(null)
+  if (!touchRef.current) touchRef.current = createGestureTracker()
+  // A finger's click has to reach the handlers from the render the press caused, so the
+  // newest ones are kept here rather than being frozen in a closure from the last render.
+  const latestHandlersRef = useRef({})
+  useEffect(() => {
+    latestHandlersRef.current.mouseDown = handleMouseDown
+    latestHandlersRef.current.mouseMove = handleMouseMove
+    latestHandlersRef.current.mouseUp = handleMouseUp
+  })
+
+  /** Drop everything a gesture was midway through, without committing any of it. */
+  function abandonGesture() {
+    setDrag(null)
+    setRotateDrag(false)
+    setResizing(null)
+    setPlacingCamera(null)
+    setPlacingObject(null)
+    setWindowDrag(null)
+    setCurrentWall(null)
+    setCurrentWire(null)
+    setWireSnap(null)
+    setRectStart(null)
+    setRectEnd(null)
+    setHoveredPoint(null)
+  }
+
+  /** The mouse handlers read only these fields, so a plain object replays a press. */
+  function asMouseEvent(event, point) {
+    return {
+      clientX: point.clientX,
+      clientY: point.clientY,
+      button: 0,
+      buttons: 1,
+      altKey: false,
+      shiftKey: false,
+      metaKey: false,
+      ctrlKey: false,
+      pointerType: event.pointerType,
+      target: canvasRef.current,
+      currentTarget: canvasRef.current,
+      preventDefault() {},
+      stopPropagation() {},
+    }
+  }
+
+  /** The canvas box, so a finger's page position can be read as plan position. */
+  function canvasRect() {
+    return canvasRef.current ? canvasRef.current.getBoundingClientRect() : { left: 0, top: 0 }
+  }
+
+  function handlePointerDown(event) {
+    const outcome = pointerDown(touchRef.current, event)
+    if (outcome.action === 'mouseDown') {
+      latestHandlersRef.current.mouseDown(event)
+      return
+    }
+    if (event.pointerType !== 'touch') return
+    const canvas = canvasRef.current
+    // Capture the finger, so a gesture that wanders off the canvas still ends here.
+    if (canvas && canvas.setPointerCapture) {
+      try { canvas.setPointerCapture(event.pointerId) } catch { /* not capturable yet */ }
+    }
+    if (outcome.action === 'pinchStart') {
+      abandonGesture()
+      beginPinch(touchRef.current, trackedPoints(touchRef.current, canvasRect()), zoom, pan)
+    }
+  }
+
+  function handlePointerMove(event) {
+    const outcome = pointerMove(touchRef.current, event)
+    if (outcome.action === 'mouseMove') {
+      latestHandlersRef.current.mouseMove(event)
+      return
+    }
+    if (outcome.action === 'pinch') {
+      const transform = pinchTransform(touchRef.current, trackedPoints(touchRef.current, canvasRect()))
+      if (transform) {
+        setZoom(transform.zoom)
+        setPan(transform.pan)
+      }
+      return
+    }
+    if (outcome.action === 'pressThenMove') {
+      latestHandlersRef.current.mouseDown(asMouseEvent(event, outcome.point))
+      latestHandlersRef.current.mouseMove(event)
+    }
+  }
+
+  function handlePointerUp(event) {
+    const outcome = pointerUp(touchRef.current, event)
+    if (outcome.action === 'mouseUp') {
+      latestHandlersRef.current.mouseUp()
+      return
+    }
+    if (outcome.action === 'tap') {
+      // A press and a release in one spot. The press is replayed now and the release on
+      // the next tick, so the release runs against the render the press caused — which is
+      // what actually places the camera instead of only arming it.
+      latestHandlersRef.current.mouseDown(asMouseEvent(event, outcome.point))
+      setTimeout(() => latestHandlersRef.current.mouseUp(), 0)
+    }
+  }
+
+  function handlePointerCancel(event) {
+    // A cancelled gesture is abandoned rather than committed: the browser taking the
+    // touch away (a system gesture, a call) is not the user letting go.
+    pointerCancel(touchRef.current, event)
+    abandonGesture()
+  }
+
+  // ── Copying what is selected ──
+  /** Copy the selected camera, or the selected item, and select the copy. */
+  function duplicateSelection() {
+    if (selectedCamera) {
+      if (camLimitReached) {
+        if (showUpgrade) showUpgrade('Camera limit reached', `Free tier supports up to ${camLimit} cameras. Upgrade to Premium for unlimited cameras.`, 'premium_monthly')
+        return
+      }
+      const copy = { ...duplicateCamera(selectedCamera), id: nextId++, label: `Cam ${cameras.length + 1}` }
+      setCameras((prev) => [...prev, copy])
+      setSelectedCamera(copy)
+      return
+    }
+    if (!selectedObject) return
+    // A copied camera preset is capped by the same limit, so a door or a window is the
+    // only thing that can be copied freely.
+    const copy = { ...duplicateObject(selectedObject), id: nextId++ }
+    setObjects((prev) => [...prev, copy])
+    setSelectedObject(copy)
+  }
+
+  /**
+   * Step the selected item with the arrow keys.
+   *
+   * A camera or a free-standing object moves by its own coordinates. A door or a window
+   * has none — it is placed along the wall it sits on — so it slides up and down that
+   * wall instead, which is what the arrow keys should do to it anyway.
+   */
+  function nudgeSelection(dx, dy) {
+    if (selectedCamera) {
+      setCameras((prev) => prev.map((c) => (c.id === selectedCamera.id ? { ...c, x: c.x + dx, y: c.y + dy } : c)))
+      setSelectedCamera((prev) => (prev ? { ...prev, x: prev.x + dx, y: prev.y + dy } : prev))
+      return true
+    }
+    if (!selectedObject) return false
+    const obj = selectedObject
+    if (obj.wallId == null) {
+      setObjects((prev) => prev.map((o) => (o.id === obj.id ? { ...o, x: o.x + dx, y: o.y + dy } : o)))
+      setSelectedObject((prev) => (prev ? { ...prev, x: prev.x + dx, y: prev.y + dy } : prev))
+      return true
+    }
+    const wall = walls.find((w) => w.id === obj.wallId)
+    if (!wall) return false
+    const p1 = wall.points[obj.segmentIndex]
+    const p2 = wall.points[(obj.segmentIndex + 1) % wall.points.length]
+    const length = Math.hypot(p2.x - p1.x, p2.y - p1.y)
+    if (length < 1e-6) return false
+    const along = (dx * (p2.x - p1.x) + dy * (p2.y - p1.y)) / (length * length)
+    const span = obj.t2 - obj.t1
+    let t1 = obj.t1 + along
+    let t2 = obj.t2 + along
+    if (t1 < 0) { t1 = 0; t2 = span }
+    if (t2 > 1) { t2 = 1; t1 = 1 - span }
+    setObjects((prev) => prev.map((o) => (o.id === obj.id ? { ...o, t1, t2 } : o)))
+    setSelectedObject((prev) => (prev && prev.id === obj.id ? { ...prev, t1, t2 } : prev))
+    return true
+  }
+
+  function deleteAnythingSelected() {
+    if (selectedRoom !== null) {
+      deleteSelectedRoom()
+      return
+    }
+    deleteSelected()
+  }
+
+  // ── Keyboard ──
+  // A plan is drawn with one hand on the mouse and the other on the keyboard: Delete,
+  // Escape, the arrow keys, Ctrl+Z and the letter of each tool. Anything typed into a
+  // field is left alone, so the room-name box is never read as a shortcut.
+  useEffect(() => {
+    function onKeyDown(event) {
+      const target = event.target
+      const typing = !!target && (
+        target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' ||
+        target.tagName === 'SELECT' || target.isContentEditable
+      )
+      const mod = event.metaKey || event.ctrlKey
+
+      // A field in front of the user keeps its own keys — Ctrl+Z inside the room-name
+      // box undoes the typing, not the plan, which is what anyone would expect.
+      if (typing) return
+
+      if (mod && (event.key === 'z' || event.key === 'Z')) {
+        event.preventDefault()
+        if (event.shiftKey) redoPlan()
+        else undoPlan()
+        return
+      }
+      if (mod && (event.key === 'y' || event.key === 'Y')) {
+        event.preventDefault()
+        redoPlan()
+        return
+      }
+      if (mod) {
+        if (event.key === 'd' || event.key === 'D') {
+          event.preventDefault()
+          duplicateSelection()
+        }
+        return
+      }
+
+      const step = (event.shiftKey ? 0.5 : 0.1) * PIXELS_PER_METER
+      const nudges = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }
+      if (nudges[event.key]) {
+        if (nudgeSelection(nudges[event.key][0], nudges[event.key][1])) event.preventDefault()
+        return
+      }
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        if (selectedCamera || selectedObject || selectedRoom !== null) {
+          event.preventDefault()
+          deleteAnythingSelected()
+        }
+        return
+      }
+      if (event.key === 'Escape') {
+        if (currentWall) { cancelWall(); return }
+        if (currentWire) { cancelWire(); return }
+        if (selectedCamera || selectedObject || selectedRoom !== null || placingCamera || placingObject) {
+          setSelectedCamera(null)
+          setSelectedObject(null)
+          setSelectedRoom(null)
+          abandonGesture()
+          return
+        }
+        if (mode !== 'select') armSelect()
+        return
+      }
+
+      const tools = { v: 'select', w: 'wall', r: 'rectangle', l: 'wire' }
+      const key = typeof event.key === 'string' ? event.key.toLowerCase() : ''
+      if (tools[key]) {
+        setSideTab('tools')
+        setShowSidebar(true)
+        activateTool(tools[key])
+        return
+      }
+      if (key === 'c') {
+        setSideTab('cameras')
+        setShowSidebar(true)
+        placeCatalogCamera(selectedPreset.id)
+        return
+      }
+      if (key === 'o') {
+        setSideTab('objects')
+        setShowSidebar(true)
+        placeCatalogObject(activeObjectPreset)
+      }
+    }
+
+    // Registered on every render on purpose: the handler closes over the current plan,
+    // and a stale copy would nudge a camera that has since been deleted.
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  })
+
   const [size, setSize] = useState({ width: 800, height: 600 })
   const previousMode = useRef(mode)
 
@@ -335,8 +721,10 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       ))
     }
 
-    document.addEventListener('mousemove', smoothDoorRotation)
-    return () => document.removeEventListener('mousemove', smoothDoorRotation)
+    // Pointer events rather than mouse ones, so swinging a door works with a finger or a
+    // stylus as well as a mouse. One listener covers all three.
+    document.addEventListener('pointermove', smoothDoorRotation)
+    return () => document.removeEventListener('pointermove', smoothDoorRotation)
   }, [rotateDrag, objects, walls, origin, pan, zoom])
 
   // Continue the id counter past anything the plan arrived with, so a new camera
@@ -360,6 +748,37 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       if (Array.isArray(snapshot.wires)) setWires(snapshot.wires)
     }
   })
+
+  // Whatever route a plan arrived by — drawn here, restored from the dashboard, or a
+  // shared #plan= link — its rooms get a name that is present and unique before anything
+  // prints one. Only a missing name, or an automatic name that clashes, is replaced, so
+  // this never overwrites a name the user typed. Same array back means no re-render.
+  useEffect(() => {
+    setWalls((prev) => ensureRoomLabels(prev))
+  }, [walls])
+
+  // Offer the plan to the timeline on every change, and only store it once it settles.
+  // The Undo button lights up immediately; the entry itself lands when the drag ends.
+  useEffect(() => {
+    const snapshot = planSnapshotNow()
+    latestPlanRef.current = snapshot
+    const history = historyRef.current
+    if (history.current() === null) {
+      // The plan the session opened with is the state undo goes back to.
+      history.record(snapshot)
+      setHistoryFlagsFor(history.canUndo(), history.canRedo())
+      return undefined
+    }
+    setHistoryFlagsFor(history.canUndo() || history.current() !== snapshot, history.canRedo())
+    if (historyTimerRef.current) clearTimeout(historyTimerRef.current)
+    historyTimerRef.current = setTimeout(() => {
+      historyTimerRef.current = null
+      if (history.record(latestPlanRef.current)) setHistoryFlagsFor(history.canUndo(), history.canRedo())
+    }, 400)
+    return () => {
+      if (historyTimerRef.current) clearTimeout(historyTimerRef.current)
+    }
+  }, [walls, cameras, objects, wires, activeFloor])
 
   // Anything the toolbar has to say clears itself, so it cannot go stale.
   useEffect(() => {
@@ -412,10 +831,10 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     // The plan's scale, on the canvas: nothing else tells you what a metre is here.
     drawScaleBar(ctx, w, h, zoom)
 
-    for (const wall of walls) {
+    walls.forEach((wall, i) => {
       drawWall(ctx, wall, origin, pan, zoom, objects)
-      drawRoomLabel(ctx, wall, origin, pan, zoom)
-    }
+      drawRoomLabel(ctx, wall, origin, pan, zoom, roomDisplayName(wall, i))
+    })
     if (currentWall) {
       drawWall(ctx, currentWall, origin, pan, zoom, [])
     }
@@ -744,9 +1163,11 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     <div className="app">
       <div className="toolbar">
         <div className="tools">
-          <button className={mode === 'select' ? 'active' : ''} onClick={armSelect} title="Select, move and rotate what is already on the plan">
+          <button className={mode === 'select' ? 'active' : ''} onClick={armSelect} title="Select, move and rotate what is already on the plan (V)">
             Select
           </button>
+          <button onClick={undoPlan} disabled={!historyFlags.canUndo} title="Undo the last change (Ctrl+Z)">↶ Undo</button>
+          <button onClick={redoPlan} disabled={!historyFlags.canRedo} title="Redo the change you just undid (Ctrl+Shift+Z)">↷ Redo</button>
         </div>
         <div className="controls">
           <div className="floor-switch">
@@ -793,16 +1214,37 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
               picked up while the Objects tool is still armed, and it should still be
               movable, rotatable and deletable from here. */}
           {selectedCamera && (
-            <button onClick={deleteSelected}>Delete Camera</button>
+            <>
+              <button onClick={duplicateSelection} title="Place another camera like this one (Ctrl+D)">Copy camera</button>
+              <button onClick={deleteSelected}>Delete Camera</button>
+            </>
           )}
           {selectedObject && (
             <>
               <button onClick={rotateSelectedObject}>Rotate 90°</button>
+              <button onClick={duplicateSelection} title="Place another one of these (Ctrl+D)">Copy item</button>
               <button onClick={deleteSelected}>Delete Object</button>
             </>
           )}
           {selectedRoom !== null && (
-            <button onClick={deleteSelectedRoom}>Delete Room</button>
+            <>
+              {/* Uncontrolled and keyed by the room, so the box shows this room's name
+                  and typing in it is never overwritten by a re-render mid-edit. */}
+              <label className="room-name">
+                Room:
+                <input
+                  key={`room-name-${selectedRoom}`}
+                  type="text"
+                  defaultValue={normalizeRoomName(walls[selectedRoom]?.label)}
+                  placeholder={roomDisplayName(walls[selectedRoom], selectedRoom)}
+                  maxLength={MAX_ROOM_NAME}
+                  title="Name this room — the report and the blind-spot list use it"
+                  onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+                  onBlur={(e) => renameSelectedRoom(e.currentTarget.value)}
+                />
+              </label>
+              <button onClick={deleteSelectedRoom}>Delete Room</button>
+            </>
           )}
           <button onClick={aiPlaceWithModel} disabled={aiBusy} title="Premium: AI-suggested camera positions">
             {aiBusy ? '✨ Analysing the plan…' : '✨ AI Place Cameras'}{aiLocked ? ' 🔒' : ''}
@@ -832,12 +1274,17 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       </div>
       <div className="workspace">
         <div className="canvas-wrap" ref={containerRef}>
+          {/* Pointer events, not mouse ones: a finger, a stylus and a mouse all arrive
+              here. The CSS class carries `touch-action: none`, without which a finger
+              drags the page instead of the plan. */}
           <canvas
             ref={canvasRef}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseUp}
+            className="plan-canvas"
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerCancel={handlePointerCancel}
+            onPointerLeave={(event) => { if (event.pointerType !== 'touch') handlePointerUp(event) }}
             onWheel={handleWheel}
           />
           <div className="zoom-controls">
@@ -1237,7 +1684,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     }
   }
 
-  /** Every floor in the plan, whichever one happens to be on screen. */
+  /* Every floor in the plan, whichever one happens to be on screen. */
   function planFloors() {
     return FLOOR_NAMES.map((name, i) => {
       const saved = floorsRef.current[i]

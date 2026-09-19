@@ -145,6 +145,19 @@ export function EntitlementsProvider({ children }) {
       setDevCode(null)
       setDeliveryError(null)
     },
+    /** Ask for a password-reset code. Says nothing about whether the address exists. */
+    async requestPasswordReset(email) {
+      return api.requestPasswordReset(email)
+    },
+    /** Set a new password with the emailed code. This signs the account in. */
+    async confirmPasswordReset(email, code, password) {
+      const u = await api.confirmPasswordReset(email, code, password)
+      setUser(u)
+      setPendingEmail(null)
+      setDevCode(null)
+      setDeliveryError(null)
+      return u
+    },
     async logout() { await api.logout(); setUser(null); setFloorplans([]) },
     async startCheckout(item, kind) {
       try {

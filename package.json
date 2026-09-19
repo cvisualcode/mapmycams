@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "test": "node scripts/test-all.mjs",
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
@@ -16,7 +17,14 @@
     "ai:test": "node scripts/test-ai.mjs",
     "ai:key": "node scripts/push-ai-key.mjs",
     "coverage:test": "node scripts/test-coverage.mjs",
-    "plan:test": "node scripts/test-plan.mjs"
+    "plan:test": "node scripts/test-plan.mjs",
+    "rooms:test": "node scripts/test-rooms.mjs",
+    "history:test": "node scripts/test-history.mjs",
+    "smoke:test": "node scripts/smoke-editor.mjs",
+    "gestures:test": "node scripts/test-gestures.mjs",
+    "duplicate:test": "node scripts/test-duplicate.mjs",
+    "reset:test": "node scripts/test-reset.mjs",
+    "visibility:test": "node scripts/test-visibility.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",

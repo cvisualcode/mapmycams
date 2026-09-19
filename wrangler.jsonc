@@ -40,7 +40,11 @@
       "/webhooks/*",
       "/admin/*",
       "/ai/*",
-      "/analytics"
+      "/analytics",
+      // Uncaught errors from a visitor's browser. Not listed here, this path was
+      // answered by the static handler with a 405 and every report was lost — which
+      // is the one failure a reporter must not have.
+      "/report-error"
     ]
   }
 }

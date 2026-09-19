@@ -62,6 +62,12 @@ export function LoginScreen({ initialTab = 'login', onBack }) {
     try { await ent.login('Admin', 'Admin1') } catch (err) { setError(err.message) } finally { setBusy(false) }
   }
 
+  // A forgotten password is a third path through the same card, so it lives in its own
+  // component rather than turning this form into a state machine.
+  if (tab === 'reset') {
+    return <PasswordResetScreen initialEmail={email} onBack={() => { setTab('login'); setError(''); setNotice('') }} />
+  }
+
   return (
     <div className="auth-screen">
       <div className="auth-card">
@@ -92,6 +98,13 @@ export function LoginScreen({ initialTab = 'login', onBack }) {
             </button>
           </div>
           {tab === 'signup' && <PasswordChecklist password={password} />}
+          {tab === 'login' && (
+            <p className="auth-forgot">
+              <button type="button" onClick={() => { setTab('reset'); setError(''); setNotice('') }}>
+                Forgot your password?
+              </button>
+            </p>
+          )}
           {error && <div className="auth-error">{error}</div>}
           {notice && <div className="auth-notice">{notice}</div>}
           <button className="auth-btn" disabled={busy}>{busy ? 'Please wait…' : tab === 'login' ? 'Sign in' : 'Create account'}</button>
@@ -115,6 +128,147 @@ export function LoginScreen({ initialTab = 'login', onBack }) {
           session is a short-lived token rather than a stored login. Repeated failed attempts lock the account for
           15 minutes. See the GDPR note in your dashboard.
         </p>
+      </div>
+    </div>
+  )
+}
+
+// ─── Forgotten password ──────────────────────────────────────────────────────
+// Two steps in one card: the address, then the emailed code with a new password.
+//
+// Nothing about the account changes until the code that was mailed to it comes back,
+// and the answer to the first step is identical whether or not there is an account
+// behind the address — otherwise this form would be a way to find out who is
+// registered. Setting a new password retires the sessions issued against the old one.
+
+export function PasswordResetScreen({ initialEmail = '', onBack }) {
+  const ent = useEntitlements()
+  const [email, setEmail] = useState(initialEmail)
+  const [sent, setSent] = useState(null)
+  const [code, setCode] = useState('')
+  const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [cooldown, setCooldown] = useState(0)
+
+  useEffect(() => {
+    if (cooldown <= 0) return undefined
+    const timer = setTimeout(() => setCooldown((s) => s - 1), 1000)
+    return () => clearTimeout(timer)
+  }, [cooldown])
+
+  async function request(e) {
+    if (e?.preventDefault) e.preventDefault()
+    setError(''); setBusy(true)
+    try {
+      const res = await ent.requestPasswordReset(email)
+      setSent(res)
+      setCode('')
+      setCooldown(res?.wait || 60)
+    } catch (err) {
+      setError(err.message || 'Could not start the reset')
+    } finally { setBusy(false) }
+  }
+
+  async function confirm(e) {
+    e.preventDefault()
+    setError(''); setBusy(true)
+    try {
+      // On success the shell signs in and this screen goes away with it.
+      await ent.confirmPasswordReset(email, code, password)
+    } catch (err) {
+      setError(err.message || 'That code is not correct')
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="auth-screen">
+      <div className="auth-card">
+        <button className="auth-back" onClick={onBack}>← Back to sign in</button>
+        <div className="auth-brand"><span className="auth-logo">▲</span> MapMyCams</div>
+        <h1>{sent ? 'Choose a new password' : 'Forgot your password?'}</h1>
+        <p className="auth-sub">
+          {sent
+            ? <>We sent a 6-digit code to <strong>{email}</strong>. Enter it with the password you want to use from now on.</>
+            : 'Enter the email address on your account and we will send a 6-digit code.'}
+        </p>
+
+        {!sent ? (
+          <form onSubmit={request}>
+            <input
+              className="auth-input"
+              placeholder="Email address"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="email"
+              required
+              autoFocus
+            />
+            {error && <div className="auth-error">{error}</div>}
+            <button className="auth-btn" disabled={busy}>{busy ? 'Sending…' : 'Send reset code'}</button>
+          </form>
+        ) : (
+          <form onSubmit={confirm}>
+            <input
+              className="auth-input auth-code"
+              placeholder="000000"
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              aria-label="6-digit password reset code"
+              autoFocus
+            />
+            <div className="auth-pass">
+              <input
+                className="auth-input"
+                placeholder="New password"
+                type={showPassword ? 'text' : 'password'}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="new-password"
+                required
+              />
+              <button type="button" className="auth-eye" onClick={() => setShowPassword((v) => !v)} title={showPassword ? 'Hide password' : 'Show password'}>
+                {showPassword ? '🙈' : '👁'}
+              </button>
+            </div>
+            <PasswordChecklist password={password} />
+            {sent.devCode && (
+              <div className="auth-warn">
+                ⚠ We couldn’t email the code{sent.deliveryError ? ` (${sent.deliveryError})` : ''}, so here it is instead.
+                <strong className="auth-code-inline">{sent.devCode}</strong>
+                Set <code>RESEND_API_KEY</code> and <code>EMAIL_FROM</code> on the server to have it sent for real.
+              </div>
+            )}
+            {error && <div className="auth-error">{error}</div>}
+            <button className="auth-btn" disabled={busy || code.length !== 6}>
+              {busy ? 'Setting…' : 'Set new password'}
+            </button>
+          </form>
+        )}
+
+        {sent && (
+          <>
+            <button className="auth-admin" onClick={request} disabled={busy || cooldown > 0}>
+              {cooldown > 0 ? `Send another code in ${cooldown}s` : 'Send another code'}
+            </button>
+            <p className="auth-legal">
+              Nothing arrives? It can take a minute, and the address has to be the one on the account.
+              Codes expire after 10 minutes.
+            </p>
+          </>
+        )}
+        {!sent && (
+          <p className="auth-legal">
+            Nothing about your account changes until the code we email you comes back, so a request you
+            did not make is harmless. Setting a new password also signs out any device that was already
+            signed in.
+          </p>
+        )}
       </div>
     </div>
   )
@@ -708,17 +862,32 @@ export function PricingPage({ onBack }) {
 
 // ─── Admin panel ─────────────────────────────────────────────────────────────
 
+/** Sum one event across the days the server returned. */
+function totalOf(funnel = {}, event) {
+  return Object.values(funnel).reduce((sum, counts) => sum + (Number(counts?.[event]) || 0), 0)
+}
+
 export function AdminPanel({ onBack }) {
   const ent = useEntitlements()
   const [users, setUsers] = useState([])
   const [analytics, setAnalytics] = useState(null)
   const [announcement, setAnnouncement] = useState('')
   const [flags, setFlags] = useState(api.getFlags())
+  // null while it is being read, false when this host has no API to read it from.
+  const [server, setServer] = useState(null)
 
   useState(() => {
     api.adminListUsers().then(setUsers).catch(() => {})
     setAnalytics(api.getAnalyticsSnapshot())
   })
+
+  useEffect(() => {
+    let live = true
+    api.adminStats()
+      .then((data) => { if (live) setServer(data || false) })
+      .catch(() => { if (live) setServer(false) })
+    return () => { live = false }
+  }, [])
 
   if (!ent.user?.isAdmin) {
     return <div className="dashboard"><p className="spec-hint">Admin access required.</p><button className="btn-ghost" onClick={onBack}>← Back</button></div>
@@ -746,6 +915,54 @@ export function AdminPanel({ onBack }) {
                 <div className="fp-row" key={ev}><span>{ev}</span><span>{n}</span></div>
               ))}
             </div>
+          )}
+        </section>
+        <section className="dash-card">
+          <h3>All visitors · last 7 days</h3>
+          {server === null && <p className="spec-hint">Reading…</p>}
+          {server === false && (
+            <p className="spec-hint">
+              These numbers are counted by the API, so a host without one has none — the card above is
+              this browser's own log.
+            </p>
+          )}
+          {server && (
+            <>
+              <div className="stat-grid">
+                <div className="stat"><span>{totalOf(server.funnel, 'landing_view')}</span><label>Home page views</label></div>
+                <div className="stat"><span>{totalOf(server.funnel, 'landing_cta')}</span><label>Home page clicks</label></div>
+                <div className="stat"><span>{totalOf(server.funnel, 'signup_started')}</span><label>Sign-ups started</label></div>
+                <div className="stat"><span>{totalOf(server.funnel, 'email_verified')}</span><label>Accounts verified</label></div>
+                <div className="stat"><span>{totalOf(server.funnel, 'checkout_completed')}</span><label>Purchases completed</label></div>
+              </div>
+              <div className="fp-list">
+                {Object.entries(server.funnel).sort((a, b) => b[0].localeCompare(a[0])).map(([day, counts]) => (
+                  <div className="fp-row" key={day}>
+                    <span>{day}</span>
+                    <span>{Object.entries(counts).map(([ev, n]) => `${ev} ${n}`).join(' · ')}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+        <section className="dash-card">
+          <h3>Errors visitors hit</h3>
+          {server?.errors?.length ? (
+            <div className="fp-list">
+              {server.errors.slice(0, 12).map((row) => (
+                <div className="fp-row" key={`${row.firstSeen}-${row.message}`}>
+                  <span title={row.stack || row.where}>{row.message}</span>
+                  <span>{row.count}× · {new Date(row.lastSeen).toLocaleDateString()}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="spec-hint">
+              {server === false
+                ? 'This host has no API, so nothing can be reported to it.'
+                : 'Nothing reported. Uncaught errors in a visitor\u2019s browser land here by themselves.'}
+            </p>
           )}
         </section>
         <section className="dash-card">
