@@ -15,7 +15,7 @@
 
 // The extension is explicit so this module can also be imported by plain Node, which
 // is what lets the placement tests run without a bundler (Vite accepts both).
-import { PIXELS_PER_METER, isPointInPolygon, objectCentre } from './plan-drawing.js'
+import { PIXELS_PER_METER, isPointInPolygon, objectCentre, lineOfSightBlocked } from './plan-drawing.js'
 
 /** How much a target is worth. A door is the thing you most want watched; an outlet
  *  matters mainly because a camera needs power nearby. */
@@ -68,45 +68,18 @@ function distanceToSegment(px, py, a, b) {
   return Math.hypot(px - (a.x + t * dx), py - (a.y + t * dy))
 }
 
-/** Is the straight line from a to b cut by any wall of a room other than `ownRoom`? */
-function rayBlocked(a, b, rooms, ownRoom, objects) {
-  for (const room of rooms) {
-    if (room === ownRoom) continue
-    const pts = room.points
-    for (let i = 0; i < pts.length; i++) {
-      const a1 = pts[i]
-      const a2 = pts[(i + 1) % pts.length]
-      const d = (b.x - a.x) * (a2.y - a1.y) - (b.y - a.y) * (a2.x - a1.x)
-      if (Math.abs(d) < 1e-9) continue
-      const t = ((a1.x - a.x) * (a2.y - a1.y) - (a1.y - a.y) * (a2.x - a1.x)) / d
-      const u = ((a1.x - a.x) * (b.y - a.y) - (a1.y - a.y) * (b.x - a.x)) / d
-      if (t > 0.02 && t < 0.98 && u > 0 && u < 1) return true
-    }
-  }
-  // Something solid in the way (a closed door, a safe) blocks the view — but only
-  // if it sits between the two, never the object being looked at.
-  for (const o of objects) {
-    if (!o || !o.blocksVision) continue
-    const c = objectCentre(o, rooms)
-    if (!c) continue
-    const halfW = ((o.width || 1) * PIXELS_PER_METER) / 2 + 4
-    const halfH = ((o.height || 1) * PIXELS_PER_METER) / 2 + 4
-    const withinBox = Math.abs(c.x - b.x) < halfW && Math.abs(c.y - b.y) < halfH
-    if (withinBox) continue
-    const onSegment = Math.abs(c.x - a.x) <= Math.abs(b.x - a.x) + halfW && Math.abs(c.y - a.y) <= Math.abs(b.y - a.y) + halfH
-    if (!onSegment) continue
-    const t = lengthAlong(a, b, c)
-    if (t > 0.05 && t < 0.95 && Math.abs(c.x - (a.x + (b.x - a.x) * t)) < halfW && Math.abs(c.y - (a.y + (b.y - a.y) * t)) < halfH) return true
-  }
-  return false
-}
-
-function lengthAlong(a, b, p) {
-  const dx = b.x - a.x
-  const dy = b.y - a.y
-  const len = dx * dx + dy * dy
-  if (len === 0) return 0
-  return ((p.x - a.x) * dx + (p.y - a.y) * dy) / len
+/**
+ * Is the view from a to b cut by a wall, a doorway-less partition, a swung door leaf
+ * or something solid?
+ *
+ * Delegated to the one sight rule in plan-drawing.js so the solver, the blind-spot
+ * report and the drawn field of view can never disagree about what a camera can see.
+ * `walls` is meant to be every wall on the floor, not just the closed rooms: an
+ * interior partition drawn as an open line blocks a view too, and a doorway is a hole
+ * a camera can see through, which is exactly the placement an installer wants.
+ */
+function rayBlocked(a, b, walls, objects) {
+  return lineOfSightBlocked(a.x, a.y, b.x, b.y, walls, objects)
 }
 
 /**
@@ -209,7 +182,7 @@ export function buildCandidates(rooms, proposals = []) {
 }
 
 /** Which targets a camera at this position and angle can see. */
-export function visibleTargets(cam, targets, rooms, objects) {
+export function visibleTargets(cam, targets, walls, objects) {
   const seen = []
   const range = (cam.distance || RANGE_METRES) * PIXELS_PER_METER
   for (const t of targets) {
@@ -219,7 +192,7 @@ export function visibleTargets(cam, targets, rooms, objects) {
     const bearing = (Math.atan2(dy, dx) * 180) / Math.PI
     const rel = ((bearing - cam.rotation + 540) % 360) - 180
     if (Math.abs(rel) > (cam.hFov || FOV_DEGREES) / 2) continue
-    if (rayBlocked(cam, t, rooms, cam.room || null, objects)) continue
+    if (rayBlocked(cam, t, walls, objects)) continue
     seen.push(t)
   }
   return seen
@@ -231,13 +204,13 @@ export function visibleTargets(cam, targets, rooms, objects) {
  * n is a room's worth of cells, and it is what makes the camera look *at* the door
  * rather than vaguely across the room.
  */
-export function bestHeading(position, targets, rooms, objects) {
+export function bestHeading(position, targets, walls, objects) {
   const range = RANGE_METRES * PIXELS_PER_METER
   const reachable = []
   for (const t of targets) {
     const dx = t.x - position.x, dy = t.y - position.y
     if (Math.hypot(dx, dy) > range) continue
-    if (rayBlocked(position, t, rooms, position.room || null, objects)) continue
+    if (rayBlocked(position, t, walls, objects)) continue
     reachable.push({ target: t, bearing: (Math.atan2(dy, dx) * 180) / Math.PI })
   }
 
@@ -295,8 +268,7 @@ export function planCameraPlacement({ walls = [], objects = [], cameras = [], pr
 
   // Cameras already on the plan count: never cover the same place twice.
   for (const cam of cameras) {
-    const room = rooms.find((r) => isPointInPolygon(cam.x, cam.y, r.points)) || null
-    for (const t of visibleTargets({ ...cam, room, hFov: cam.hFov || FOV_DEGREES }, targets, rooms, objects)) covered.add(t)
+    for (const t of visibleTargets({ ...cam, hFov: cam.hFov || FOV_DEGREES }, targets, walls, objects)) covered.add(t)
   }
 
   const candidates = buildCandidates(rooms, proposals)
@@ -306,7 +278,7 @@ export function planCameraPlacement({ walls = [], objects = [], cameras = [], pr
   while (chosen.length < maxCameras) {
     let winner = null
     for (const cand of candidates) {
-      const heading = bestHeading(cand, targets, rooms, objects)
+      const heading = bestHeading(cand, targets, walls, objects)
       const fresh = heading.seen.filter((t) => !covered.has(t))
       if (fresh.length === 0) continue
       const weight = fresh.reduce((sum, t) => sum + t.weight, 0)

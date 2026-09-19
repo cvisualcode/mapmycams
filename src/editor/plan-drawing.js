@@ -29,14 +29,48 @@ export const PRESETS = [
   { id: 'dome', label: 'Dome', hFov: 110, distance: 10, color: '#f472b6' },
   { id: 'ptz', label: 'PTZ', hFov: 30, distance: 50, color: '#fbbf24' },
 ];
+// Sizes are real metres, because the plan is measured in them: a domestic safe is
+// 450 mm across, a straight flight about 1.1 m, a socket plate a little over 150 mm.
+//
+// The outlet is the one deliberate fudge. At its true 146 × 86 mm it would be a twelve
+// by seven pixel target at 100% zoom — unhittable on a phone — so it is drawn a touch
+// over a real plate. `singleShot` means the tool lets go of itself once one is placed,
+// which is what a flight of stairs wants: put it down, then turn it to suit the house
+// before starting another.
 export const OBJECT_PRESETS = [
-  { id: 'safe', label: 'Safe', width: 0.6, height: 0.5, blocksVision: true, color: '#ef4444' },
-  { id: 'window', label: 'Window', width: 1.2, height: 0.1, blocksVision: false, color: '#3b82f6', resizable: true },
-  { id: 'door', label: 'Door', width: DOOR_WIDTH_METERS, blocksVision: true, color: '#f59e0b', resizable: false },
-  { id: 'power', label: 'Power Outlet', width: 0.3, height: 0.3, blocksVision: false, color: '#facc15', isPowerSource: true },
-  { id: 'stairs-straight', label: 'Stairs · Straight', width: 1.1, height: 0.35, blocksVision: false, color: '#8b5cf6' },
-  { id: 'stairs-curved', label: 'Stairs · Curved', width: 1.3, height: 1.3, blocksVision: false, color: '#a78bfa' },
+  { id: 'safe', label: 'Safe', width: 0.45, height: 0.4, blocksVision: true, color: '#ef4444' },
+  // `mounted` means it lives on a wall and is picked by its span along that wall, so its
+  // height is the wall's thickness rather than something a finger has to hit.
+  { id: 'window', label: 'Window', width: 1.2, height: 0.1, blocksVision: false, color: '#3b82f6', resizable: true, mounted: true },
+  { id: 'door', label: 'Door', width: DOOR_WIDTH_METERS, blocksVision: true, color: '#f59e0b', resizable: false, mounted: true },
+  { id: 'power', label: 'Power Outlet', width: 0.2, height: 0.15, blocksVision: false, color: '#facc15', isPowerSource: true },
+  { id: 'stairs-straight', label: 'Stairs · Straight', width: 1.1, height: 0.35, blocksVision: false, color: '#8b5cf6', singleShot: true },
+  { id: 'stairs-curved', label: 'Stairs · Curved', width: 1.3, height: 1.3, blocksVision: false, color: '#a78bfa', singleShot: true },
 ]
+
+/** Tools that let go of themselves once one object is placed. */
+export const SINGLE_SHOT_PRESETS = OBJECT_PRESETS.filter((p) => p.singleShot).map((p) => p.id)
+
+export function isSingleShot(presetId) {
+  return SINGLE_SHOT_PRESETS.includes(presetId)
+}
+
+/**
+ * Should a placement tool let go of itself now that the plan has grown?
+ *
+ * A flight of stairs is placed one at a time on purpose: the flight goes down, then gets
+ * turned to suit the house, and the tool has to be picked up again before another
+ * follows. Asked as a plain question so the rule can be tested without a browser.
+ *
+ * `added` is how much the plan grew by. A negative number is an undo, and a plan
+ * arriving from a saved file is not a placement either — neither should knock a tool out
+ * of your hand.
+ */
+export function shouldDisarmAfterPlacement({ added, mode, armedPresetId, placedPresetId }) {
+  if (!(added > 0)) return false
+  if (mode !== 'object') return false
+  return placedPresetId === armedPresetId && isSingleShot(placedPresetId)
+}
 
 // Free end-points that wires can snap to. Cameras use cam-<id>, power outlets use power-<id>.
 export const SNAP_RADIUS_PX = 18
@@ -373,11 +407,18 @@ export function drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, extraW
           const segDoors = doors.filter((d) => d.segmentIndex === j)
           const hitInWindow = segWindows.some((w) => u >= w.t1 && u <= w.t2)
           const hitInDoorOpening = segDoors.some((door) => u >= door.t1 && u <= door.t2)
+          // A hole is a *position*, not a property of one wall: two rooms drawn side
+          // by side each own a copy of the wall between them, so a doorway has to
+          // open both copies. Without this the cone stopped dead at the door while
+          // the blind-spot report counted the next room as watchable through it —
+          // the same code twice, disagreeing, which is what this section is about.
+          const hitWorld = toWorld(start.x + t * dx, start.y + t * dy, origin, pan, zoom)
+          const throughOpening = hitInWindow || hitInDoorOpening || isOpeningPoint(hitWorld.x, hitWorld.y, allWalls, objects)
 
           // Windows and doors replace this part of the wall. The door leaf is
           // tested independently below, so the opening itself must not keep
           // the original wall segment in the ray path.
-          if (!hitInWindow && !hitInDoorOpening && t < nearest) {
+          if (!throughOpening && t < nearest) {
             nearest = t
           }
         }
@@ -864,76 +905,351 @@ export function drawWall(ctx, wall, origin, pan, zoom, objects) {
   }
 }
 
-// ── AI blind-spot detection ──────────────────────────────────────────────────
-// Samples a grid across every closed room and reports rooms (or areas) that no
-// camera FOV reaches, treating walls and vision-blocking objects as opaque.
-export function computeBlindSpots(walls, cameras, objects) {
-  const closed = walls.filter((w) => w.closed !== false && w.points.length >= 3)
-  if (closed.length === 0) return []
-  // Sampled every 1.5 m: fine enough to find a doorway-sized gap, coarse enough that
-  // a whole house is a few thousand samples rather than a few hundred thousand.
-  const CELL = 1.5 * PIXELS_PER_METER
-  const blind = []
-  for (const wall of closed) {
-    const xs = wall.points.map((pt) => pt.x)
-    const ys = wall.points.map((pt) => pt.y)
-    const minX = Math.min(...xs), maxX = Math.max(...xs)
-    const minY = Math.min(...ys), maxY = Math.max(...ys)
-    const cells = []
-    for (let x = minX + CELL / 2; x < maxX; x += CELL) {
-      for (let y = minY + CELL / 2; y < maxY; y += CELL) {
-        if (!isPointInPolygon(x, y, wall.points)) continue
-        const visible = cameras.some((cam) => {
-          const dx = x - cam.x, dy = y - cam.y
-          const dist = Math.hypot(dx, dy)
-          if (dist > (cam.distance || 10) * PIXELS_PER_METER) return false
-          const ang = (Math.atan2(dy, dx) * 180) / Math.PI
-          const rel = ((ang - cam.rotation) % 360 + 540) % 360 - 180
-          if (Math.abs(rel) > (cam.hFov || 90) / 2) return false
-          // occlusion by walls (excluding the camera's own boundary crossing) and solid objects
-          for (const w of closed) {
-            const pts = w.points
-            for (let i = 0; i < pts.length; i++) {
-              const a1 = pts[i], a2 = pts[(i + 1) % pts.length]
-              if (segRayBlocked(cam.x, cam.y, x, y, a1, a2, wall, w)) return false
-            }
-          }
-          for (const o of objects) {
-            if (!o.blocksVision) continue
-            // A door or a safe on a wall has no x/y of its own — its centre has to be
-            // resolved from the wall it sits on, or it never blocks anything.
-            const c = objectCentre(o, closed)
-            if (!c) continue
-            const halfW = ((o.width || 1) * PIXELS_PER_METER) / 2, halfH = ((o.height || 1) * PIXELS_PER_METER) / 2
-            if (Math.abs(c.x - x) < halfW + 8 && Math.abs(c.y - y) < halfH + 8 && Math.abs(c.x - cam.x) < Math.abs(dx) && Math.abs(c.y - cam.y) < Math.abs(dy)) return false
-          }
-          return true
-        })
-        if (!visible) cells.push({ x, y })
-      }
-    }
-    if (cells.length > 0) blind.push({ wall, label: roomDisplayName(wall, walls.indexOf(wall)), cells, area: cells.length * (CELL / PIXELS_PER_METER) * (CELL / PIXELS_PER_METER) })
+// ── Line of sight ────────────────────────────────────────────────────────────
+// ONE definition of "can this camera see that point", shared by the drawn field of
+// view, the blind-spot sampler and the AI placement solver. Each of the three used
+// to carry its own test, and they disagreed with one another — which is how the
+// picture and the report could make opposite claims about the same room:
+//
+//   · a camera outside the house was credited with seeing a room through its wall,
+//     because the room being looked at was exempt from its own boundary;
+//   · a doorway was solid to the report but a hole to the drawn cone;
+//   · an interior partition drawn as an open polyline was invisible to both.
+//
+// The rule now: a wall blocks, unless it is a hole (a doorway or a window), or the
+// camera and the thing being looked at are both inside that same room.
+
+/** How near an opening's span a crossing has to land to count as "through the hole". */
+const OPENING_TOLERANCE_METRES = 0.08
+
+/** The closed room that contains a point, or null when it is outside every room. */
+export function roomContaining(x, y, walls) {
+  for (const wall of walls || []) {
+    if (!wall || wall.closed === false) continue
+    if (!Array.isArray(wall.points) || wall.points.length < 3) continue
+    if (isPointInPolygon(x, y, wall.points)) return wall
   }
-  return blind
+  return null
 }
 
 /**
- * Does the segment from the camera to the target cross this wall segment?
- *
- * Takes plain coordinates, which is how the blind-spot sampler calls it. (It used to
- * take two point objects while every caller passed numbers, so the arithmetic came
- * out NaN and no wall ever blocked anything — blind spots were reported as covered
- * whenever the angle and the range happened to fit, walls or no walls.)
+ * The endpoints of a wall's index-th segment, or null when it has no such segment.
+ * A closed wall wraps its last point back to the first; an open one has one segment
+ * fewer than it has points.
  */
-export function segRayBlocked(camX, camY, targetX, targetY, a1, a2, camWall, segWall) {
-  const d = (targetX - camX) * (a2.y - a1.y) - (targetY - camY) * (a2.x - a1.x)
-  if (Math.abs(d) < 1e-9) return false
-  const t = ((a1.x - camX) * (a2.y - a1.y) - (a1.y - camY) * (a2.x - a1.x)) / d
-  const u = ((a1.x - camX) * (targetY - camY) - (a1.y - camY) * (targetX - camX)) / d
-  if (!(t > 0.02 && t < 0.98 && u > 0 && u < 1)) return false
-  // A camera inside a room isn't occluded by that room's own boundary for
-  // targets in the same room; it IS blocked by other rooms' walls.
-  return segWall !== camWall
+export function wallSegment(wall, index) {
+  const pts = wall && wall.points
+  if (!Array.isArray(pts) || pts.length < 2) return null
+  const i = (((Math.trunc(index) || 0) % pts.length) + pts.length) % pts.length
+  const j = wall.closed === false ? i + 1 : (i + 1) % pts.length
+  if (j >= pts.length) return null
+  return { a: pts[i], b: pts[j] }
+}
+
+/**
+ * The hole a door or a window makes in its wall, as a world-space segment, or null.
+ *
+ * It is the stretch of wall between the two jambs (t1..t2) and it stays put when the
+ * door swings — the leaf is what moves, and it is tested separately.
+ */
+export function openingSpan(obj, walls) {
+  if (!obj || obj.wallId == null) return null
+  if (obj.presetId !== 'door' && obj.presetId !== 'window') return null
+  const wall = (walls || []).find((w) => w.id === obj.wallId)
+  if (!wall) return null
+  const seg = wallSegment(wall, obj.segmentIndex || 0)
+  if (!seg) return null
+  const t1 = obj.t1 ?? 0
+  const t2 = obj.t2 ?? 1
+  return {
+    a: { x: seg.a.x + (seg.b.x - seg.a.x) * t1, y: seg.a.y + (seg.b.y - seg.a.y) * t1 },
+    b: { x: seg.a.x + (seg.b.x - seg.a.x) * t2, y: seg.a.y + (seg.b.y - seg.a.y) * t2 },
+  }
+}
+
+/**
+ * Is this position in the plan one of the holes a door or window makes in a wall?
+ *
+ * Asked of the position rather than of the wall, because two rooms drawn side by side
+ * each carry their own copy of the wall between them: opening a doorway has to punch
+ * through both, or a camera in the hall still cannot see through the door.
+ */
+export function isOpeningPoint(x, y, walls, objects, tolerance = OPENING_TOLERANCE_METRES * PIXELS_PER_METER) {
+  for (const obj of objects || []) {
+    const span = openingSpan(obj, walls)
+    if (!span) continue
+    const near = projectPointOnSegment(x, y, span.a.x, span.a.y, span.b.x, span.b.y)
+    if (Math.hypot(x - near.x, y - near.y) <= tolerance) return true
+  }
+  return false
+}
+
+/**
+ * Where the line from the camera to the target crosses segment a–b, as a fraction
+ * along that line, or null when it does not cross it. Crossings at either end are
+ * ignored: a wall at the camera, or at the thing being looked at, is not in the way.
+ */
+function sightCrossing(camX, camY, targetX, targetY, a, b) {
+  const dx = targetX - camX
+  const dy = targetY - camY
+  const det = dx * (b.y - a.y) - dy * (b.x - a.x)
+  if (Math.abs(det) < 1e-9) return null
+  const t = ((a.x - camX) * (b.y - a.y) - (a.y - camY) * (b.x - a.x)) / det
+  const u = ((a.x - camX) * dy - (a.y - camY) * dx) / det
+  if (!(t > 0.02 && t < 0.98 && u > 0 && u < 1)) return null
+  return t
+}
+
+/** Is the point being looked at part of this object? Then it cannot block itself. */
+function targetIsObject(x, y, obj, walls) {
+  const span = openingSpan(obj, walls)
+  if (span) {
+    const near = projectPointOnSegment(x, y, span.a.x, span.a.y, span.b.x, span.b.y)
+    return Math.hypot(x - near.x, y - near.y) <= OPENING_TOLERANCE_METRES * PIXELS_PER_METER * 2
+  }
+  const centre = objectCentre(obj, walls)
+  if (!centre) return false
+  const preset = OBJECT_PRESETS.find((p) => p.id === obj.presetId)
+  const halfW = ((obj.width || preset?.width || 1) * PIXELS_PER_METER) / 2
+  const halfH = ((obj.height || preset?.height || 1) * PIXELS_PER_METER) / 2
+  return Math.abs(x - centre.x) <= halfW && Math.abs(y - centre.y) <= halfH
+}
+
+/** Does the ray towards the target pass through this axis-aligned box? */
+export function boxCutsSight(camX, camY, targetX, targetY, cx, cy, halfW, halfH) {
+  const dx = targetX - camX
+  const dy = targetY - camY
+  let near = 0.02
+  let far = 0.98
+  for (const [origin, dir, lo, hi] of [[camX, dx, cx - halfW, cx + halfW], [camY, dy, cy - halfH, cy + halfH]]) {
+    if (Math.abs(dir) < 1e-9) {
+      if (origin < lo || origin > hi) return false
+      continue
+    }
+    let tA = (lo - origin) / dir
+    let tB = (hi - origin) / dir
+    if (tA > tB) { const swap = tA; tA = tB; tB = swap }
+    near = Math.max(near, tA)
+    far = Math.min(far, tB)
+    if (near > far) return false
+  }
+  return true
+}
+
+/**
+ * Can a camera here see that point, as far as walls, doors and furniture are
+ * concerned? Range and field of view are the caller's business — see cameraSeesPoint.
+ */
+export function lineOfSightBlocked(camX, camY, targetX, targetY, walls, objects) {
+  const all = walls || []
+  const camRoom = roomContaining(camX, camY, all)
+  const interior = camRoom !== null && camRoom === roomContaining(targetX, targetY, all)
+  const dx = targetX - camX
+  const dy = targetY - camY
+
+  for (const wall of all) {
+    if (!wall || !Array.isArray(wall.points) || wall.points.length < 2) continue
+    if (interior && wall === camRoom) continue
+    const segments = wall.closed === false ? wall.points.length - 1 : wall.points.length
+    for (let i = 0; i < segments; i++) {
+      const seg = wallSegment(wall, i)
+      if (!seg) continue
+      const t = sightCrossing(camX, camY, targetX, targetY, seg.a, seg.b)
+      if (t === null) continue
+      // A doorway or a window is a hole in the wall, so the sight line goes through.
+      if (isOpeningPoint(camX + dx * t, camY + dy * t, all, objects)) continue
+      return true
+    }
+  }
+
+  for (const obj of objects || []) {
+    if (!obj || targetIsObject(targetX, targetY, obj, all)) continue
+    // A door on a wall is drawn as its leaf, and the leaf is solid even though the
+    // doorway it hangs in is a hole.
+    if (obj.presetId === 'door' && obj.wallId != null) {
+      const wall = all.find((w) => w.id === obj.wallId)
+      const leaf = wall ? getDoorSegmentWorld(obj, wall) : null
+      if (leaf && sightCrossing(camX, camY, targetX, targetY, leaf.start, leaf.end) !== null) return true
+      continue
+    }
+    if (!obj.blocksVision) continue
+    const centre = objectCentre(obj, all)
+    if (!centre) continue
+    const preset = OBJECT_PRESETS.find((p) => p.id === obj.presetId)
+    const halfW = ((obj.width || preset?.width || 1) * PIXELS_PER_METER) / 2
+    const halfH = ((obj.height || preset?.height || 1) * PIXELS_PER_METER) / 2
+    if (boxCutsSight(camX, camY, targetX, targetY, centre.x, centre.y, halfW, halfH)) return true
+  }
+  return false
+}
+
+/** The area of a closed polygon in world pixels², unsigned. */
+export function polygonArea(points) {
+  if (!Array.isArray(points) || points.length < 3) return 0
+  let sum = 0
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i]
+    const b = points[(i + 1) % points.length]
+    sum += a.x * b.y - b.x * a.y
+  }
+  return Math.abs(sum) / 2
+}
+
+// ── AI blind-spot detection ──────────────────────────────────────────────────
+/** The most cells the floor is ever cut into, so this stays fast inside a render. */
+const MAX_BLIND_SAMPLES = 24000
+
+/**
+ * Sample the floor of every closed room and report the areas no camera can see.
+ *
+ * Sampled at half the drawing grid (0.5 m), not the 1.5 m it used to be: a doorway is
+ * 0.9 m wide, so the old grid could step straight over the one gap a camera was meant
+ * to watch, and the answer changed with the room's origin. On a large plan the cell
+ * grows so the sample count stays bounded.
+ *
+ * Rooms come back worst-first, each with its blind area in real square metres, which
+ * is what the toolbar, the score and the PDF report all quote.
+ */
+export function computeBlindSpots(walls, cameras, objects, options = {}) {
+  const closed = (walls || []).filter((w) => w && w.closed !== false && Array.isArray(w.points) && w.points.length >= 3)
+  if (closed.length === 0) return []
+  const rooms = closed.map((wall) => ({
+    wall,
+    label: roomDisplayName(wall, walls.indexOf(wall)),
+    area: polygonArea(wall.points) / (PIXELS_PER_METER * PIXELS_PER_METER),
+  }))
+  const totalArea = rooms.reduce((sum, room) => sum + room.area, 0)
+  const cellMetres = Math.max(options.cellMetres ?? GRID_METERS, Math.sqrt(totalArea / MAX_BLIND_SAMPLES))
+  const cell = cellMetres * PIXELS_PER_METER
+  const cellArea = cellMetres * cellMetres
+  const blind = []
+
+  for (const room of rooms) {
+    const xs = room.wall.points.map((pt) => pt.x)
+    const ys = room.wall.points.map((pt) => pt.y)
+    const minX = Math.min(...xs), maxX = Math.max(...xs)
+    const minY = Math.min(...ys), maxY = Math.max(...ys)
+    const cells = []
+    for (let x = minX + cell / 2; x < maxX; x += cell) {
+      for (let y = minY + cell / 2; y < maxY; y += cell) {
+        if (!isPointInPolygon(x, y, room.wall.points)) continue
+        const point = { x, y }
+        const seen = (cameras || []).some((cam) => cameraSeesPoint(cam, point) && !lineOfSightBlocked(cam.x, cam.y, x, y, walls, objects))
+        if (!seen) cells.push(point)
+      }
+    }
+    if (cells.length === 0) continue
+    const area = cells.length * cellArea
+    const centre = cells.reduce((acc, pt) => ({ x: acc.x + pt.x / cells.length, y: acc.y + pt.y / cells.length }), { x: 0, y: 0 })
+    blind.push({
+      wall: room.wall,
+      label: room.label,
+      cells,
+      cell,
+      cellMetres,
+      area,
+      roomArea: room.area,
+      fraction: room.area > 0 ? Math.min(1, area / room.area) : 0,
+      centre,
+    })
+  }
+  blind.sort((a, b) => b.area - a.area)
+  return blind
+}
+
+/** "8.4 m² blind — Kitchen 3.2 m², Hall 2.6 m²" — the one-line version for toolbars. */
+export function describeBlindSpots(blindSpots, limit = 3) {
+  if (!blindSpots || blindSpots.length === 0) return ''
+  const total = blindSpots.reduce((sum, spot) => sum + spot.area, 0)
+  const named = blindSpots.slice(0, limit).map((spot) => `${spot.label} ${spot.area.toFixed(1)} m²`)
+  const rest = blindSpots.length - named.length
+  return `${total.toFixed(1)} m² blind — ${named.join(', ')}${rest > 0 ? ` and ${rest} more room${rest === 1 ? '' : 's'}` : ''}`
+}
+
+/**
+ * The score's coverage line, measured in square metres instead of room count.
+ *
+ * computeHealthScore() grades coverage on how many rooms have any gap in them, which
+ * charges a dark corner in the hall the same as a bedroom no camera reaches. The
+ * sampler already knows each room's blind area, so the honest number is a subtraction
+ * away — and it is the same number the red patches and the toolbar quote.
+ */
+export function coverageCheck(blindSpots, walls) {
+  const rooms = (walls || []).filter((w) => w && w.closed !== false && Array.isArray(w.points) && w.points.length >= 3)
+  const totalArea = rooms.reduce((sum, room) => sum + polygonArea(room.points), 0) / (PIXELS_PER_METER * PIXELS_PER_METER)
+  if (rooms.length === 0) {
+    return { earned: 0, max: 20, ratio: 0, blindArea: 0, totalArea, advice: 'Close a room with the Wall or Rectangle tool to score coverage.' }
+  }
+  const spots = blindSpots || []
+  const blindArea = spots.reduce((sum, spot) => sum + spot.area, 0)
+  const ratio = totalArea > 0 ? Math.min(1, blindArea / totalArea) : 0
+  const named = spots.slice(0, 3).map((spot) => `${spot.label} ${spot.area.toFixed(1)} m²`)
+  const rest = spots.length - named.length
+  return {
+    earned: spots.length === 0 ? 20 : Math.round(20 * (1 - ratio)),
+    max: 20,
+    ratio,
+    blindArea,
+    totalArea,
+    advice: spots.length === 0
+      ? 'Every sampled point of every room is in a camera’s view.'
+      : `No camera watches ${named.join(', ')}${rest > 0 ? ` and ${rest} more room${rest === 1 ? '' : 's'}` : ''} — ${blindArea.toFixed(1)} m² of ${totalArea.toFixed(1)} m² (${Math.round(ratio * 100)}%).`,
+  }
+}
+
+/**
+ * A health score whose coverage line is measured in square metres.
+ *
+ * The score table was written when coverage was a room count; this swaps that one line
+ * for the sampler's own areas and moves the total by the difference. Every surface the
+ * planner shows then says the same thing: the red patches, the toolbar summary, this
+ * panel and the PDF report.
+ */
+export function scoreWithAreaCoverage(health, walls) {
+  if (!health || !Array.isArray(health.checks)) return health
+  const existing = health.checks.find((c) => c.key === 'coverage')
+  if (!existing) return health
+  const check = coverageCheck(health.blindSpots, walls)
+  return {
+    ...health,
+    checks: health.checks.map((c) => (c.key === 'coverage' ? { ...c, earned: check.earned, advice: check.advice } : c)),
+    score: health.score - existing.earned + check.earned,
+  }
+}
+
+/**
+ * Paint the blind spots onto the plan: a translucent red square per blind cell, and
+ * a label saying how much of the room it is.
+ *
+ * Drawn under the camera cones, so the picture and the report are the same claim seen
+ * twice — before this existed they were two different claims.
+ */
+export function drawBlindSpots(ctx, blindSpots, origin, pan, zoom) {
+  if (!blindSpots || blindSpots.length === 0) return
+  ctx.save()
+  ctx.fillStyle = 'rgba(239, 68, 68, 0.30)'
+  for (const spot of blindSpots) {
+    const size = spot.cell * zoom
+    for (const pt of spot.cells) {
+      const c = toCanvas(pt.x, pt.y, origin, pan, zoom)
+      ctx.fillRect(c.x - size / 2, c.y - size / 2, size, size)
+    }
+  }
+  if (typeof ctx.font === 'string' || ctx.font === undefined) ctx.font = 'bold 11px system-ui, sans-serif'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  for (const spot of blindSpots) {
+    // A stray cell or two is not worth a label over the drawing.
+    if (!spot.centre || spot.area < 0.5) continue
+    const c = toCanvas(spot.centre.x, spot.centre.y, origin, pan, zoom)
+    const text = `${spot.area.toFixed(1)} m² blind`
+    ctx.lineWidth = 3
+    ctx.strokeStyle = 'rgba(15, 23, 42, 0.8)'
+    if (ctx.strokeText) ctx.strokeText(text, c.x, c.y)
+    ctx.fillStyle = '#fecaca'
+    ctx.fillText(text, c.x, c.y)
+  }
+  ctx.restore()
 }
 
 export function isPointInPolygon(x, y, polygon) {

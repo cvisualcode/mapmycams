@@ -23,6 +23,7 @@
     "smoke:test": "node scripts/smoke-editor.mjs",
     "gestures:test": "node scripts/test-gestures.mjs",
     "duplicate:test": "node scripts/test-duplicate.mjs",
+    "pick:test": "node scripts/test-pick.mjs",
     "reset:test": "node scripts/test-reset.mjs",
     "visibility:test": "node scripts/test-visibility.mjs"
   },

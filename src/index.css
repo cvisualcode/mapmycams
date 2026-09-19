@@ -6,13 +6,27 @@
   font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, sans-serif;
   color: #0f172a;
   background: #f1f5f9;
+  /* A phone in landscape inflates text unless it is told not to, which is enough to
+     push the planner's toolbar onto another row for no reason. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
+html,
 body {
   margin: 0;
+  max-width: 100%;
+  /* Nothing here is meant to scroll sideways — the toolbar wraps instead — so any
+     horizontal overflow is a bug. `clip` rather than `hidden`: hidden would make the
+     body a scroll container and break the dashboard's sticky header. */
+  overflow-x: clip;
 }
 
 #root {
   width: 100%;
   height: 100vh;
+  /* The *visible* height. On a phone 100vh is taller than the screen while the address
+     bar is showing, and the toolbar would sit underneath it. Older browsers keep the
+     100vh above. */
+  height: 100dvh;
 }

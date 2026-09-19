@@ -17,6 +17,7 @@ const SUITES = [
   ['history:test', 'test-history.mjs'],
   ['gestures:test', 'test-gestures.mjs'],
   ['duplicate:test', 'test-duplicate.mjs'],
+  ['pick:test', 'test-pick.mjs'],
   ['plan:test', 'test-plan.mjs'],
   ['coverage:test', 'test-coverage.mjs'],
   ['ai:test', 'test-ai.mjs'],

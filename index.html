@@ -3,7 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover is what makes env(safe-area-inset-*) real numbers on a
+         notched phone, so the toolbar and the zoom buttons can keep clear of the
+         rounded corners and the home indicator. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <!-- The home page is the only thing anonymous visitors and link previews see,
          so the title and description have to describe the product, not the repo. -->
     <title>MapMyCams — Security camera floor planner</title>

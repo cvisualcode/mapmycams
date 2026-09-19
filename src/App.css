@@ -12,15 +12,23 @@
   align-items: center;
   justify-content: space-between;
   padding: 8px 12px;
+  /* Clear of a notched phone's rounded corners. The plain padding above is what older
+     browsers use, since an unsupported env() throws the whole declaration away. */
+  padding-left: max(12px, env(safe-area-inset-left));
+  padding-right: max(12px, env(safe-area-inset-right));
   background: #0f172a;
   color: #f8fafc;
 }
 
+/* The two ends of the toolbar. Wrapping here is what keeps a phone from scrolling
+   sideways: the bar wraps between the two groups, and each group wraps within itself. */
 .tools,
 .controls {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+  min-width: 0;
 }
 
 .toolbar button {
@@ -138,6 +146,9 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* Above the home indicator rather than under it. */
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  right: calc(16px + env(safe-area-inset-right));
 }
 
 .zoom-controls button {
@@ -617,7 +628,9 @@
 .dash-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 24px; background: #fff; border-bottom: 1px solid #e2e8f0; position: sticky; top: 0; z-index: 10; }
 .dash-nav { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .plan-chip { background: #ede9fe; color: #6d28d9; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px; }
-.dash-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; padding: 24px; max-width: 1200px; margin: 0 auto; }
+/* min(300px, 100%) so a narrow phone gets one full-width column instead of a 300px
+   column that overflows the 24px of padding on each side. */
+.dash-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 18px; padding: 24px; max-width: 1200px; margin: 0 auto; }
 .dash-card { background: #fff; border-radius: 14px; padding: 20px; box-shadow: 0 1px 4px rgba(2,6,23,.06); }
 .dash-card h3 { margin: 0 0 10px; font-size: 16px; }
 /* Result of a trip to Stripe, shown across the top of the dashboard. */
@@ -639,7 +652,7 @@
 
 .pricing-page { min-height: 100vh; background: #f1f5f9; padding-bottom: 60px; }
 .pricing-page h1 { text-align: center; margin: 30px 0; }
-.pricing-grid, .addons-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+.pricing-grid, .addons-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 18px; max-width: 1100px; margin: 0 auto; padding: 0 24px; }
 .price-card { background: #fff; border-radius: 14px; padding: 24px; box-shadow: 0 1px 4px rgba(2,6,23,.06); position: relative; display: flex; flex-direction: column; }
 .price-card.highlighted { border: 2px solid #7c3aed; }
 .price-card.current { border: 2px solid #10b981; }
@@ -871,9 +884,47 @@
    brand instead of disappearing entirely — the pricing jump is the one people
    actually want from a phone. */
 @media (max-width: 720px) {
+  /* A fixed background is re-painted on every scroll on iOS, which makes the landing
+     page stutter on a phone. */
+  .landing { background-attachment: scroll; }
   .landing-nav { flex-wrap: wrap; justify-content: center; gap: 10px 20px; }
   .landing-brand { order: 1; }
   .landing-nav-actions { order: 2; }
   .landing-nav-links { order: 3; flex-basis: 100%; justify-content: center; gap: 20px; font-size: 13px; }
   .landing-note { margin-top: -18px; text-align: left; }
+}
+
+/* ── The planner on a phone, or a tablet held in one hand ─────────────────────
+   The toolbar is the only chrome on screen, so it may take as many rows as it needs
+   and every control is a finger-sized target. Hints get a row to themselves rather
+   than squeezing the buttons beside them, and the sidebar becomes a full-width sheet
+   instead of a 310px column over a 150px-wide plan. */
+@media (max-width: 720px) {
+  .toolbar { gap: 6px; padding: 6px 8px; }
+  .tools,
+  .controls { gap: 6px; width: 100%; }
+  .toolbar button { padding: 9px 12px; }
+  .toolbar .hint { flex-basis: 100%; margin: 0; }
+  .toolbar .room-name input { width: 120px; }
+  .sidebar { width: 100%; }
+  .zoom-controls button { width: 44px; height: 44px; }
+}
+
+/* A finger is not a mouse: a keyboard-sized button is a miss waiting to happen. Keyed
+   on the pointer rather than the width, because a tablet is wide and still all fingers. */
+@media (pointer: coarse) {
+  .toolbar button { padding: 10px 13px; }
+  .zoom-controls button { width: 46px; height: 46px; }
+  .side-tab { padding: 14px 9px; }
+}
+
+/* Full-height surfaces measured against the *visible* viewport rather than the window,
+   so a phone's address bar cannot cover the bottom of a page. Everything above keeps
+   its 100vh for browsers that have never heard of dvh. */
+@supports (height: 100dvh) {
+  .app { height: 100dvh; }
+  .auth-screen,
+  .dashboard,
+  .pricing-page,
+  .landing { min-height: 100dvh; }
 }

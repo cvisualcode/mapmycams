@@ -15,6 +15,7 @@ import {
   beginPinch, pinchTransform, trackedPoints,
 } from './editor/pointer-gestures'
 import { duplicateCamera, duplicateObject } from './editor/duplicate'
+import { findPlacedObjectAt } from './editor/pick'
 import './App.css'
 import {
   PIXELS_PER_METER,
@@ -45,6 +46,9 @@ import {
   drawWindowOnWallSegment,
   drawWall,
   computeBlindSpots,
+  describeBlindSpots,
+  drawBlindSpots,
+  scoreWithAreaCoverage,
   clickHitsWallShape,
   drawObject,
   drawWire,
@@ -55,6 +59,8 @@ import {
   aiSuggestSpots,
   computeHealthScore,
   scoreBand,
+  openingSpan,
+  shouldDisarmAfterPlacement,
 } from './editor/plan-drawing'
 
 // Ids for cameras, objects, walls and wires. Module scope so two items placed in
@@ -196,7 +202,15 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   // The score walks the whole plan, so it is only worked out while its tab is
   // open. It is shown out of the points actually on offer rather than a fixed 100,
   // so a floor that passes every check reads as a full house.
-  const health = showSidebar && sideTab === 'score' ? computeHealthScore(walls, cameras, objects, wires) : null
+  // The object currently in your hand, if there is one. Tapping the same one in the
+  // sidebar again puts it down, so a tap on the plan goes back to selecting what is
+  // already on it rather than placing another.
+  const loadedObjectId = sideSelection && sideSelection.type === 'object' ? sideSelection.id : null
+  const loadedCameraId = sideSelection && sideSelection.type === 'camera' ? sideSelection.id : null
+
+  // The coverage line is re-scored by area, from the sampler's own numbers, so the
+  // score panel, the red patches and the toolbar summary cannot disagree.
+  const health = showSidebar && sideTab === 'score' ? scoreWithAreaCoverage(computeHealthScore(walls, cameras, objects, wires), walls) : null
   const healthMax = health ? health.checks.reduce((sum, check) => sum + check.max, 0) : 0
   const healthBand = health ? scoreBand(healthMax > 0 ? Math.round((health.score / healthMax) * 100) : 0) : null
 
@@ -222,13 +236,29 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   function placeCatalogCamera(presetId) {
     const preset = PRESETS.find((p) => p.id === presetId)
     if (!preset) return
+    // Tapping the camera already in your hand puts it down, the same way an object does.
+    // With the camera tool armed every tap on the plan places another one, so this is how
+    // you get back to moving the cameras you have already put down.
+    if (loadedCameraId === presetId) {
+      armSelect()
+      setToolNotice(`${preset.label} put down — tap a camera on the plan to move it.`)
+      return
+    }
     setSelectedPreset(preset)
     setMode('camera')
     setSideSelection({ type: 'camera', id: presetId })
+    setToolNotice(`${preset.label} in your hand — tap the plan to place it, or tap it again to put it down.`)
   }
 
   function placeCatalogObject(preset) {
     if (!preset) return
+    // Tapping the object already in your hand puts it down. That is the way back to
+    // selecting: with a tool armed every tap on the plan is a placement.
+    if (loadedObjectId === preset.id) {
+      armSelect()
+      setToolNotice(`${preset.label} put down — tap something on the plan to select it.`)
+      return
+    }
     setActiveObjectPreset(preset)
     setMode('object')
     setShowObjectPanel(true)
@@ -237,6 +267,9 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     setPlacingObject(null)
     setWindowDrag(null)
     setSideSelection({ type: 'object', id: preset.id })
+    setToolNotice(preset.singleShot
+      ? `${preset.label}: tap the plan to place one. It is left selected so you can turn it, then tap the tool again for another.`
+      : `${preset.label} in your hand — tap the plan to place it, or tap ${preset.label} again to put it down.`)
   }
 
   /**
@@ -445,9 +478,42 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     return canvasRef.current ? canvasRef.current.getBoundingClientRect() : { left: 0, top: 0 }
   }
 
+  /**
+   * A press on something already on the plan selects it and lets the tool go, instead of
+   * stacking another one on top of it.
+   *
+   * This is why a safe could feel impossible to pick up: with the object tool armed, every
+   * press put another one down, so the thing under your finger was never the thing that
+   * got selected. Windows and doors are deliberately left out — tapping near a wall is how
+   * one of those is placed, and wanting two doors side by side is reasonable.
+   *
+   * Answers true when the press has been dealt with and must not reach the tool.
+   */
+  function selectPlacedObjectInstead(event, allowDrag) {
+    if (mode !== 'object' || placingObject || windowDrag) return false
+    const world = getMouseWorld(event)
+    const hit = findPlacedObjectAt(world, objects, walls, zoom)
+    if (!hit || hit.presetId === 'window' || hit.presetId === 'door') return false
+    armSelect()
+    setSelectedObject(hit)
+    setSelectedRoom(null)
+    setSelectedCamera(null)
+    // The press that picks it up can also be the start of a drag, so the safe that was
+    // impossible to grab is slid across the room in one gesture. Only where a release is
+    // certain to follow: a tap replays no mouse-up, and a drag left open would carry on
+    // following the pointer with nothing held down.
+    const preset = OBJECT_PRESETS.find((p) => p.id === hit.presetId)
+    if (allowDrag && !(preset && preset.resizable)) {
+      setDrag({ type: 'moveObject', objectId: hit.id, startX: world.x, startY: world.y })
+    }
+    setToolNotice('Selected — drag it to move it, or use Rotate and Delete.')
+    return true
+  }
+
   function handlePointerDown(event) {
     const outcome = pointerDown(touchRef.current, event)
     if (outcome.action === 'mouseDown') {
+      if (selectPlacedObjectInstead(event, true)) return
       latestHandlersRef.current.mouseDown(event)
       return
     }
@@ -478,7 +544,11 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       return
     }
     if (outcome.action === 'pressThenMove') {
-      latestHandlersRef.current.mouseDown(asMouseEvent(event, outcome.point))
+      // A finger that has travelled is a drag, so picking up what is under it beats
+      // putting another one down on top of it. The lift that follows clears the drag.
+      if (!selectPlacedObjectInstead(asMouseEvent(event, outcome.point), true)) {
+        latestHandlersRef.current.mouseDown(asMouseEvent(event, outcome.point))
+      }
       latestHandlersRef.current.mouseMove(event)
     }
   }
@@ -493,6 +563,9 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       // A press and a release in one spot. The press is replayed now and the release on
       // the next tick, so the release runs against the render the press caused — which is
       // what actually places the camera instead of only arming it.
+      // A tap only selects: no drag is started, because nothing here replays the release
+      // that would end it.
+      if (selectPlacedObjectInstead(asMouseEvent(event, outcome.point), false)) return
       latestHandlersRef.current.mouseDown(asMouseEvent(event, outcome.point))
       setTimeout(() => latestHandlersRef.current.mouseUp(), 0)
     }
@@ -787,6 +860,45 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     return () => clearTimeout(timer)
   }, [toolNotice])
 
+  // The plan is painted from the canvas's own pixel size, so the canvas has to hear about
+  // that size changing: a tablet turned on its side, a phone's address bar sliding away, a
+  // window being dragged. Without this the drawing keeps the size it was first painted at
+  // and the browser stretches it — which is what makes a plan look wrong on a phone.
+  const [viewportTick, setViewportTick] = useState(0)
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return undefined
+    const bump = () => setViewportTick((tick) => tick + 1)
+    if (typeof ResizeObserver === 'function') {
+      const observer = new ResizeObserver(bump)
+      observer.observe(container)
+      return () => observer.disconnect()
+    }
+    window.addEventListener('resize', bump)
+    window.addEventListener('orientationchange', bump)
+    return () => {
+      window.removeEventListener('resize', bump)
+      window.removeEventListener('orientationchange', bump)
+    }
+  }, [])
+
+  // A tool that places one and then lets go. The object is committed in the pointer-up
+  // handler, so the letting-go watches the plan rather than the click: the moment a flight
+  // of stairs lands, the tool is put down and the stair is left selected to be turned.
+  // Undo, a restored plan or the AI placing cameras leave the tool alone, because those do
+  // not grow the plan while a stair tool is in your hand.
+  const placedCountRef = useRef(0)
+  useEffect(() => {
+    const added = objects.length - placedCountRef.current
+    placedCountRef.current = objects.length
+    const last = objects[objects.length - 1]
+    if (!shouldDisarmAfterPlacement({ added, mode, armedPresetId: activeObjectPreset.id, placedPresetId: last && last.presetId })) return
+    armSelect()
+    setSelectedObject(last)
+    const preset = OBJECT_PRESETS.find((p) => p.id === last.presetId)
+    setToolNotice(`${preset ? preset.label : 'Placed'} placed and selected — turn it to suit the house, then tap the tool again for the next one.`)
+  }, [objects, mode, activeObjectPreset])
+
   useEffect(() => {
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d')
@@ -882,6 +994,9 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       for (const w of ghostWalls) for (const p of w.points) allPts.push(p)
       ghostHull = convexHull(allPts)
     }
+    // Areas the cameras miss, painted under the cones and the camera markers, so what
+    // the report claims and what the plan shows are the same thing seen twice.
+    if (aiBlindSpots.length > 0) drawBlindSpots(ctx, aiBlindSpots, origin, pan, zoom)
     for (const cam of cameras) {
       const cp = toCanvas(cam.x, cam.y, origin, pan, zoom)
       drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, currentWall ? [currentWall] : [], activeFloor === FLOOR_NAMES.length - 1, ghostWalls, ghostHull)
@@ -999,17 +1114,33 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       drawObject(ctx, obj, origin, pan, zoom, walls)
       if (selectedObject && selectedObject.id === obj.id) {
         const preset = OBJECT_PRESETS.find((p) => p.id === obj.presetId)
-        if (preset && preset.resizable && obj.presetId !== 'window') {
+        const span = preset ? openingSpan(obj, walls) : null
+        // Every object gets marked, not just the ones that can be resized. The old test
+        // here was `preset.resizable`, and the only resizable preset is the window, which
+        // it then excluded — so selecting a safe, a socket or a stair changed nothing on
+        // screen, and the tap looked like it had been ignored.
+        ctx.strokeStyle = '#3b82f6'
+        ctx.lineWidth = 2
+        ctx.setLineDash([4, 4])
+        if (span && obj.presetId !== 'door') {
+          // A window marks the opening it sits in, along its wall.
+          const a = toCanvas(span.a.x, span.a.y, origin, pan, zoom)
+          const b = toCanvas(span.b.x, span.b.y, origin, pan, zoom)
+          ctx.beginPath()
+          ctx.moveTo(a.x, a.y)
+          ctx.lineTo(b.x, b.y)
+          ctx.lineWidth = 4
+          ctx.stroke()
+        } else if (preset && obj.x != null) {
           const cp = toCanvas(obj.x, obj.y, origin, pan, zoom)
-          const w = (obj.width || preset.width) * PIXELS_PER_METER * zoom
-          const h = (obj.height || preset.height) * PIXELS_PER_METER * zoom
-          ctx.strokeStyle = '#3b82f6'
-          ctx.lineWidth = 2
-          ctx.setLineDash([4, 4])
+          // Never smaller than 14 px on screen, so a socket is as clearly selected as a
+          // room is, whatever the zoom.
+          const w = Math.max((obj.width || preset.width) * PIXELS_PER_METER * zoom, 14)
+          const h = Math.max((obj.height || preset.height) * PIXELS_PER_METER * zoom, 14)
           ctx.strokeRect(cp.x - w / 2, cp.y - h / 2, w, h)
-          ctx.setLineDash([])
         }
-        // door selection visuals are drawn separately above when `selectedObject` is a door
+        ctx.setLineDash([])
+        // Door selection visuals are drawn separately above when `selectedObject` is a door
       }
     }
 
@@ -1113,7 +1244,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       ctx.stroke()
       ctx.setLineDash([])
     }
-  }, [walls, currentWall, cameras, pan, zoom, origin, mode, size, placingCamera, selectedCamera, rectStart, rectEnd, objects, placingObject, selectedRoom, hoveredPoint, activeObjectPreset, selectedObject, windowDrag, wires, wireSnap, currentWire, activeFloor])
+  }, [walls, currentWall, cameras, pan, zoom, origin, mode, size, placingCamera, selectedCamera, rectStart, rectEnd, objects, placingObject, selectedRoom, hoveredPoint, activeObjectPreset, selectedObject, windowDrag, wires, wireSnap, currentWire, activeFloor, viewportTick])
   function getMouseWorld(e) {
     const canvas = canvasRef.current
     const rect = canvas.getBoundingClientRect()
@@ -1257,11 +1388,16 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
               {aiSource === 'model' ? '✨ ' : '⚙️ '}{aiNote}
             </span>
           )}
-          <button onClick={runBlindSpotDetection} title="Premium: report areas no camera can see">🧭 Blind Spots{aiLocked ? ' 🔒' : ''}</button>
+          <button onClick={runBlindSpotDetection} title="Premium: shade the areas no camera can see on the plan">
+            🧭 Blind Spots{aiLocked ? ' 🔒' : ''}
+          </button>
           {aiBlindSpots.length > 0 && (
-            <span className="hint" title="Rooms with areas no camera can see">
-              ⚠ Blind spots: {aiBlindSpots.map((b) => b.label).join(', ')}
-            </span>
+            <>
+              <span className="hint" title="The red patches on the plan are the areas no camera reaches, and how much of each room that is">
+                ⚠ {describeBlindSpots(aiBlindSpots)}
+              </span>
+              <button onClick={() => setAiBlindSpots([])} title="Take the blind-spot shading back off the plan">✕ Clear spots</button>
+            </>
           )}
           <button onClick={exportImage} title={watermarked ? 'Free plan: exports carry a MapMyCams watermark' : 'Export the plan as a PNG'}>Export PNG{watermarked ? ' (watermarked)' : ''}</button>
           <button onClick={sharePlanLink} title="Premium: copy a link that opens this plan">🔗 Share link{shareLocked ? ' 🔒' : ''}</button>
