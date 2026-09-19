@@ -23,7 +23,7 @@ import {
   emailConfigured, resendCooldownRemaining, CODE_TTL_MS, CODE_MAX_ATTEMPTS,
   json, cors, rateLimit,
 } from './_lib.js'
-import { suggestSpotsWithModel } from './ai.js'
+import { suggestSpotsWithModel, PIXELS_PER_METER } from './ai.js'
 
 // Stripe price IDs come from env: PRICE_PREMIUM_MONTHLY, PRICE_PREMIUM_YEARLY,
 // PRICE_AI_PACK, PRICE_PDF_REPORT, PRICE_BRANDS. Family Sharing was dropped: the
@@ -460,19 +460,25 @@ async function dispatch(request, env) {
   }
 }
 
+// Last-resort geometry, used only when no model could answer: opposite corners of each
+// room, aiming at its middle. Distances are given in metres and converted, so this
+// stays correct at whatever scale the editor draws at (see api/ai.js).
 function suggestSpots(walls, cameras) {
   const spots = []
+  const inset = 0.2 * PIXELS_PER_METER
+  const minApart = 3 * PIXELS_PER_METER
   for (const wall of walls.filter((w) => w.closed !== false && w.points.length >= 3)) {
     const xs = wall.points.map((p) => p.x), ys = wall.points.map((p) => p.y)
     const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys)
-    for (const [x, y] of [[minX + 8, minY + 8], [maxX - 8, maxY - 8]]) {
-      if ([...cameras, ...spots].some((c) => Math.hypot(c.x - x, c.y - y) < 120)) continue
+    for (const [x, y] of [[minX + inset, minY + inset], [maxX - inset, maxY - inset]]) {
+      if ([...cameras, ...spots].some((c) => Math.hypot(c.x - x, c.y - y) < minApart)) continue
+      const diagonal = Math.hypot(maxX - minX, maxY - minY)
       spots.push({
         id: `ai_${crypto.randomUUID().slice(0, 8)}`,
         x, y,
         rotation: Math.round((Math.atan2((minY + maxY) / 2 - y, (minX + maxX) / 2 - x) * 180) / Math.PI),
         hFov: 120,
-        distance: Math.min(40, Math.max(2, Math.round((Math.hypot(maxX - minX, maxY - minY) / 2 + 40) / 40))),
+        distance: Math.min(40, Math.max(2, Math.round(diagonal / 2 / PIXELS_PER_METER + 1))),
         color: '#38bdf8',
         label: `AI Cam ${spots.length + 1}`,
       })

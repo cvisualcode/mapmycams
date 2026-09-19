@@ -33,8 +33,10 @@ const PREFERRED_GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini
 const MAX_SPOTS = 12
 const MAX_ROOMS = 14
 const TIMEOUT_MS = 15000
-const PIXELS_PER_METER = 40
-const MIN_SPACING_PX = 40
+// The editor's scale (src/editor/plan-drawing.js): the model is given a plan in pixels
+// and its answers are checked against those pixels, so these two must agree.
+export const PIXELS_PER_METER = 80
+const MIN_SPACING_PX = PIXELS_PER_METER // no two suggested cameras within a metre
 
 // Per-isolate caches: Workers reuse isolates, so this is one probe per isolate
 // rather than one per suggestion.

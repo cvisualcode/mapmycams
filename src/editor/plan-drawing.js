@@ -7,7 +7,17 @@
 //
 // src/App.jsx holds the editor component itself and imports from here.
 
-export const PIXELS_PER_METER = 40
+// How the world is measured. A plan is stored in pixels and every real-world figure
+// — room sizes, camera throw, object dimensions — is converted with this one number,
+// so changing it rescales the whole tool and nothing drifts out of proportion.
+//
+// 80 px to the metre puts a typical house (say 10 m across) over about 800 px, which
+// is a canvas rather than a corner of one, and it lets the grid square be half a
+// metre instead of a whole one.
+export const PIXELS_PER_METER = 80
+// One grid square. Half a metre is fine enough to line a 900 mm door up against a wall
+// and coarse enough that the lines don't turn into hatching at the default zoom.
+export const GRID_METERS = 0.5
 export const DOOR_WIDTH_METERS = 0.9
 export const PRESETS = [
   { id: 'indoor-wide', label: 'Indoor Wide', hFov: 90, distance: 8, color: '#4ade80' },
@@ -575,25 +585,59 @@ export function drawRectangle(ctx, x1, y1, x2, y2, zoom, widthMeters, heightMete
 }
 
 export function drawGrid(ctx, width, height, pan, zoom) {
-  // One visible grid square represents one metre.
-  const step = PIXELS_PER_METER * zoom
-  if (step < 8) return
-  ctx.strokeStyle = '#e5e7eb'
-  ctx.lineWidth = 1
-  const startX = (pan.x % step + step) % step
-  const startY = (pan.y % step + step) % step
-  for (let x = startX; x < width; x += step) {
-    ctx.beginPath()
-    ctx.moveTo(x, 0)
-    ctx.lineTo(x, height)
-    ctx.stroke()
+  // One visible grid square represents GRID_METERS, and every second line is a whole
+  // metre, so the grid can be read as either.
+  const step = GRID_METERS * PIXELS_PER_METER * zoom
+  if (step < 6) return
+  const major = step * 2
+  const lines = (offsetX, offsetY, gap, colour) => {
+    ctx.strokeStyle = colour
+    ctx.lineWidth = 1
+    for (let x = offsetX; x < width; x += gap) {
+      ctx.beginPath()
+      ctx.moveTo(x, 0)
+      ctx.lineTo(x, height)
+      ctx.stroke()
+    }
+    for (let y = offsetY; y < height; y += gap) {
+      ctx.beginPath()
+      ctx.moveTo(0, y)
+      ctx.lineTo(width, y)
+      ctx.stroke()
+    }
   }
-  for (let y = startY; y < height; y += step) {
-    ctx.beginPath()
-    ctx.moveTo(0, y)
-    ctx.lineTo(width, y)
-    ctx.stroke()
-  }
+  lines((pan.x % step + step) % step, (pan.y % step + step) % step, step, '#e5e7eb')
+  lines((pan.x % major + major) % major, (pan.y % major + major) % major, major, '#cbd5e1')
+}
+
+/**
+ * A scale bar in the corner: how much floor the pixels on screen are worth.
+ *
+ * The scale is the one thing you cannot guess from a plan, and a drawing read at the
+ * wrong scale is how a house ends up 20 m wide. Metres, because the whole tool is in
+ * metres — the bar measures the very same grid the drawing sits on.
+ */
+export function drawScaleBar(ctx, width, height, zoom) {
+  const pxPerMetre = PIXELS_PER_METER * zoom
+  const metres = [1, 2, 5, 10, 20, 50, 100].find((m) => m * pxPerMetre >= 60) || 100
+  const barPx = metres * pxPerMetre
+  const x = 16
+  const y = height - 18
+  ctx.save()
+  ctx.strokeStyle = '#475569'
+  ctx.fillStyle = '#475569'
+  ctx.lineWidth = 2
+  ctx.beginPath()
+  ctx.moveTo(x, y - 5)
+  ctx.lineTo(x, y)
+  ctx.lineTo(x + barPx, y)
+  ctx.lineTo(x + barPx, y - 5)
+  ctx.stroke()
+  ctx.font = '11px system-ui, sans-serif'
+  ctx.textAlign = 'left'
+  ctx.textBaseline = 'bottom'
+  ctx.fillText(`${metres} m  ·  1 square = ${GRID_METERS} m`, x, y - 8)
+  ctx.restore()
 }
 
 export function distanceToSegment(px, py, x1, y1, x2, y2) {
@@ -804,7 +848,9 @@ export function drawWall(ctx, wall, origin, pan, zoom, objects) {
 export function computeBlindSpots(walls, cameras, objects) {
   const closed = walls.filter((w) => w.closed !== false && w.points.length >= 3)
   if (closed.length === 0) return []
-  const CELL = 60
+  // Sampled every 1.5 m: fine enough to find a doorway-sized gap, coarse enough that
+  // a whole house is a few thousand samples rather than a few hundred thousand.
+  const CELL = 1.5 * PIXELS_PER_METER
   const blind = []
   for (const wall of closed) {
     const xs = wall.points.map((pt) => pt.x)
@@ -818,7 +864,7 @@ export function computeBlindSpots(walls, cameras, objects) {
         const visible = cameras.some((cam) => {
           const dx = x - cam.x, dy = y - cam.y
           const dist = Math.hypot(dx, dy)
-          if (dist > (cam.distance || 10) * 40) return false
+          if (dist > (cam.distance || 10) * PIXELS_PER_METER) return false
           const ang = (Math.atan2(dy, dx) * 180) / Math.PI
           const rel = ((ang - cam.rotation) % 360 + 540) % 360 - 180
           if (Math.abs(rel) > (cam.hFov || 90) / 2) return false
@@ -836,7 +882,7 @@ export function computeBlindSpots(walls, cameras, objects) {
             // resolved from the wall it sits on, or it never blocks anything.
             const c = objectCentre(o, closed)
             if (!c) continue
-            const halfW = ((o.width || 1) * 40) / 2, halfH = ((o.height || 1) * 40) / 2
+            const halfW = ((o.width || 1) * PIXELS_PER_METER) / 2, halfH = ((o.height || 1) * PIXELS_PER_METER) / 2
             if (Math.abs(c.x - x) < halfW + 8 && Math.abs(c.y - y) < halfH + 8 && Math.abs(c.x - cam.x) < Math.abs(dx) && Math.abs(c.y - cam.y) < Math.abs(dy)) return false
           }
           return true
@@ -844,7 +890,7 @@ export function computeBlindSpots(walls, cameras, objects) {
         if (!visible) cells.push({ x, y })
       }
     }
-    if (cells.length > 0) blind.push({ wall, label: wall.label || 'Room', cells, area: cells.length * (CELL / 40) * (CELL / 40) })
+    if (cells.length > 0) blind.push({ wall, label: wall.label || 'Room', cells, area: cells.length * (CELL / PIXELS_PER_METER) * (CELL / PIXELS_PER_METER) })
   }
   return blind
 }
@@ -1132,8 +1178,10 @@ export function isOnRotationHandle(canvasX, canvasY, cam, origin, pan, zoom) {
 export function aiSuggestSpots(walls, existingCameras) {
   const closed = walls.filter((w) => w.closed !== false && w.points.length >= 3)
   if (closed.length === 0) return []
-  const ppm = 40 // PIXELS_PER_METER
+  const ppm = PIXELS_PER_METER
   const RAY_COUNT = 48
+  const SAMPLE_METRES = 1.5
+  const INSET_METRES = 0.3
 
   // Sample points inside each room (grid) as the coverage targets
   const targets = []
@@ -1142,7 +1190,7 @@ export function aiSuggestSpots(walls, existingCameras) {
     const ys = wall.points.map((pt) => pt.y)
     const minX = Math.min(...xs), maxX = Math.max(...xs)
     const minY = Math.min(...ys), maxY = Math.max(...ys)
-    const step = 60
+    const step = SAMPLE_METRES * ppm
     for (let x = minX + step / 2; x < maxX; x += step) {
       for (let y = minY + step / 2; y < maxY; y += step) {
         if (isPointInPolygon(x, y, wall.points)) targets.push({ x, y, wall })
@@ -1158,10 +1206,10 @@ export function aiSuggestSpots(walls, existingCameras) {
     const ys = wall.points.map((pt) => pt.y)
     const minX = Math.min(...xs), maxX = Math.max(...xs)
     const minY = Math.min(...ys), maxY = Math.max(...ys)
-    const inset = 12
+    const inset = INSET_METRES * ppm
     for (const [x, y] of [[minX + inset, minY + inset], [maxX - inset, minY + inset], [minX + inset, maxY - inset], [maxX - inset, maxY - inset]]) {
-      const cx = Math.max(minX + 4, Math.min(maxX - 4, x))
-      const cy = Math.max(minY + 4, Math.min(maxY - 4, y))
+      const cx = Math.max(minX + inset / 3, Math.min(maxX - inset / 3, x))
+      const cy = Math.max(minY + inset / 3, Math.min(maxY - inset / 3, y))
       const room = closed.find((w) => isPointInPolygon(cx, cy, w.points))
       if (room) candidates.push({ x: cx, y: cy, wall: room })
     }

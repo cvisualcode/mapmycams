@@ -28,11 +28,13 @@ export const PRIORITY_WEIGHTS = {
 }
 const FLOOR_WEIGHT = 1
 
-const CELL = 60                 // px between sampled floor targets
+// Distances are given in metres and converted, so the solver's idea of "close to a
+// wall" or "worth sampling" does not change when the drawing scale does.
+const CELL = 1.5 * PIXELS_PER_METER    // between sampled floor targets
 const FOV_DEGREES = 110         // a wide fixed camera: fewest cameras, most coverage
 const RANGE_METRES = 12
-const WALL_CLEARANCE = 16       // px a camera is kept away from a wall
-const CORNER_INSET = 14         // px into the room from a corner — where cameras go
+const WALL_CLEARANCE = 0.4 * PIXELS_PER_METER  // a camera is kept this far off a wall
+const CORNER_INSET = 0.35 * PIXELS_PER_METER   // into the room from a corner — where cameras go
 const PRIORITY_RADIUS_METRES = 1.5
 const MAX_CAMERAS = 12
 // A camera has to earn its place: at least two weight-units of new coverage, and at
@@ -168,7 +170,7 @@ export function buildCandidates(rooms, proposals = []) {
         if (distanceToSegment(x, y, pts[i], pts[(i + 1) % pts.length]) < WALL_CLEARANCE) return
       }
     }
-    if (candidates.some((c) => Math.hypot(c.x - x, c.y - y) < 20)) return
+    if (candidates.some((c) => Math.hypot(c.x - x, c.y - y) < 0.5 * PIXELS_PER_METER)) return
     candidates.push({ x, y, room, bonus })
   }
 
@@ -193,7 +195,7 @@ export function buildCandidates(rooms, proposals = []) {
         const py = a.y + (b.y - a.y) * t
         const dirX = cx - px, dirY = cy - py
         const len = Math.hypot(dirX, dirY) || 1
-        const pull = Math.min(45, len)
+        const pull = Math.min(1.1 * PIXELS_PER_METER, len)
         push(px + (dirX / len) * pull, py + (dirY / len) * pull)
       }
     }
@@ -323,7 +325,7 @@ export function planCameraPlacement({ walls = [], objects = [], cameras = [], pr
   const priorityDone = priority.filter((t) => covered.has(t)).length
 
   const built = chosen.map((c, i) => {
-    const farthest = Math.max(...c.fresh.map((t) => Math.hypot(t.x - c.cand.x, t.y - c.cand.y)), 60)
+    const farthest = Math.max(...c.fresh.map((t) => Math.hypot(t.x - c.cand.x, t.y - c.cand.y)), 1.5 * PIXELS_PER_METER)
     return {
       id: `ai_${Math.random().toString(36).slice(2, 9)}`,
       x: Math.round(c.cand.x),

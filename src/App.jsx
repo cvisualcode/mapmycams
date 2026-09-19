@@ -30,6 +30,7 @@ import {
   drawRoomLabel,
   drawRectangle,
   drawGrid,
+  drawScaleBar,
   distanceToSegment,
   projectPointOnSegment,
   isOnDoorHandle,
@@ -403,6 +404,8 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
         drawGhostFloor(ctx, belowWalls, origin, pan, zoom)
       }
     }
+    // The plan's scale, on the canvas: nothing else tells you what a metre is here.
+    drawScaleBar(ctx, w, h, zoom)
 
     for (const wall of walls) {
       drawWall(ctx, wall, origin, pan, zoom, objects)
