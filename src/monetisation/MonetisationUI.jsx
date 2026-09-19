@@ -18,9 +18,9 @@ export function Padlock() {
 
 // ─── Login screen ────────────────────────────────────────────────────────────
 
-export function LoginScreen() {
+export function LoginScreen({ initialTab = 'login', onBack }) {
   const ent = useEntitlements()
-  const [tab, setTab] = useState('login')
+  const [tab, setTab] = useState(initialTab)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [name, setName] = useState('')
@@ -65,6 +65,7 @@ export function LoginScreen() {
   return (
     <div className="auth-screen">
       <div className="auth-card">
+        {onBack && <button className="auth-back" onClick={onBack}>← Back to home</button>}
         <div className="auth-brand"><span className="auth-logo">▲</span> MapMyCams</div>
         <h1>{tab === 'login' ? 'Welcome back' : 'Create your account'}</h1>
         <p className="auth-sub">{tab === 'login' ? 'Sign in to sync your floorplans and manage your subscription.' : 'Start on the Free tier — upgrade any time.'}</p>
@@ -523,7 +524,7 @@ export function UpgradeModal() {
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
-export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing }) {
+export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing, onHome }) {
   const ent = useEntitlements()
   const { buy, busy, notice, dismiss } = useCheckout()
   const [billing, setBilling] = useState([])
@@ -543,6 +544,7 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing }) {
         <nav className="dash-nav">
           <button className="btn-ghost" onClick={onOpenEditor}>Open planner</button>
           <button className="btn-ghost" onClick={onNewPlan}>New floorplan</button>
+          {onHome && <button className="btn-ghost" onClick={onHome}>Home</button>}
           <span className="plan-chip">{planLabel}</span>
           <button className="btn-ghost" onClick={ent.logout}>Sign out</button>
         </nav>

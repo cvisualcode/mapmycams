@@ -6,6 +6,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { useEntitlements } from './monetisation/EntitlementsContext'
 import { planShareUrl } from './monetisation/share'
+import * as api from './monetisation/api'
 import './App.css'
 import {
   PIXELS_PER_METER,
@@ -114,6 +115,45 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   const camLimit = ent ? (ent.user && ent.user.isAdmin ? Infinity : ent.limits.cameras) : Infinity
   const camLimitReached = cameras.length >= camLimit
   const [aiBlindSpots, setAiBlindSpots] = useState([])
+  // Which engine answered the last AI suggestion, and whether the server is still
+  // working on it. The model runs on the server (POST /ai/suggest) with the plan
+  // geometry; the local solver in plan-drawing.js is the fallback, so an offline
+  // browser or an exhausted quota still gets a layout.
+  const [aiSource, setAiSource] = useState(null) // 'model' | 'local'
+  const [aiBusy, setAiBusy] = useState(false)
+  // One sentence from the model about the layout it chose, shown on hover.
+  const [aiNote, setAiNote] = useState('')
+
+  /** Ask the server's AI where the cameras should go, then fall back if it cannot answer. */
+  async function aiPlaceWithModel() {
+    if (aiLocked) {
+      if (showUpgrade) showUpgrade('AI camera placement', 'Let AI analyse your floorplan geometry and place cameras at the optimal spots.', 'ai_pack')
+      return
+    }
+    setAiBusy(true)
+    let spots = []
+    let summary = ''
+    try {
+      const res = await api.aiSuggestSpots({ walls, cameras, objects })
+      // Only the model's placements are worth taking: the in-browser solver below
+      // is stronger than the server's crude geometry fallback.
+      if (res?.source === 'model' && Array.isArray(res.spots) && res.spots.length > 0) {
+        spots = res.spots
+        // Falls back to the model name, so the tooltip always says what answered.
+        summary = res.summary || (res.model ? `Placed by ${res.model}` : '')
+      }
+    } catch { /* offline, not entitled or over quota — the local solver answers */ }
+    setAiBusy(false)
+    if (spots.length === 0) {
+      setAiSource('local')
+      aiPlaceCameras()
+      return
+    }
+    setAiSource('model')
+    setAiNote(summary)
+    setCameras((prev) => [...prev, ...spots])
+    setAiBlindSpots(computeBlindSpots(walls, [...cameras, ...spots], objects))
+  }
   // Short-lived confirmation from the toolbar (link copied, pop-up blocked…).
   const [toolNotice, setToolNotice] = useState(null)
 
@@ -722,7 +762,12 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
           {mode === 'select' && selectedRoom !== null && (
             <button onClick={deleteSelectedRoom}>Delete Room</button>
           )}
-          <button onClick={aiPlaceCameras} title="Premium: AI-suggested camera positions">✨ AI Place Cameras{aiLocked ? ' 🔒' : ''}</button>
+          <button onClick={aiPlaceWithModel} disabled={aiBusy} title="Premium: AI-suggested camera positions">
+            {aiBusy ? '✨ Analysing the plan…' : '✨ AI Place Cameras'}{aiLocked ? ' 🔒' : ''}
+          </button>
+          {aiSource === 'model' && (
+            <span className="hint" title={aiNote || 'Placed by the AI model on the server'}>✨ AI layout</span>
+          )}
           <button onClick={runBlindSpotDetection} title="Premium: report areas no camera can see">🧭 Blind Spots{aiLocked ? ' 🔒' : ''}</button>
           {aiBlindSpots.length > 0 && (
             <span className="hint" title="Rooms with areas no camera can see">

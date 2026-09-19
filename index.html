@@ -4,7 +4,26 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>security-cam-floorplan</title>
+    <!-- The home page is the only thing anonymous visitors and link previews see,
+         so the title and description have to describe the product, not the repo. -->
+    <title>MapMyCams — Security camera floor planner</title>
+    <meta name="description" content="Plan a security camera layout on your own floorplan: real field-of-view coverage, blind spots, AI placement and a security score before you buy anything." />
+    <meta name="theme-color" content="#0b1220" />
+    <!-- The custom domain is the canonical host: the same app is also served from
+         *.pages.dev, and crawlable duplicates help nobody. -->
+    <link rel="canonical" href="https://mapmycams.dev/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="MapMyCams" />
+    <meta property="og:url" content="https://mapmycams.dev/" />
+    <meta property="og:title" content="MapMyCams — Security camera floor planner" />
+    <meta property="og:description" content="Draw your rooms, place the cameras you are considering, and see the coverage, the blind spots and the score — before anything is fitted." />
+    <!-- Served from public/ so the URL is stable: a bundled asset gets a
+         content hash, which a crawler cannot know in advance. -->
+    <meta property="og:image" content="https://mapmycams.dev/h.png" />
+    <meta property="og:image:width" content="1122" />
+    <meta property="og:image:height" content="680" />
+    <meta property="og:image:alt" content="A floorplan in the MapMyCams planner with camera coverage cones" />
+    <meta name="twitter:card" content="summary_large_image" />
   </head>
   <body>
     <div id="root"></div>

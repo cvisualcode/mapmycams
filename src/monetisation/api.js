@@ -1011,6 +1011,20 @@ export async function listFloorplans() {
   } catch { return local }
 }
 
+/**
+ * Where should the cameras go?
+ *
+ * Answered by the AI model on the server (POST /ai/suggest) for a Premium account
+ * or the one-off AI pack. Returns `{ spots, source, model, summary }`; `source` is
+ * 'model' when the model answered and 'solver' when the server fell back to its own
+ * geometry. Throws when the account is not entitled or the server is unreachable,
+ * which is the caller's signal to use the in-browser solver instead.
+ */
+export async function aiSuggestSpots({ walls = [], cameras = [], objects = [] } = {}) {
+  track('ai_suggest', { cameras: cameras.length, walls: walls.length })
+  return api('/ai/suggest', { walls, cameras, objects })
+}
+
 export async function saveFloorplan(name, data, id = null) {
   track('floorplan_saved', { id })
   const user = sessionUser()

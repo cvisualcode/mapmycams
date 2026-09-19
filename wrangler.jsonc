@@ -12,6 +12,13 @@
     // Absolute origin of the app — used for Stripe redirect URLs.
     "APP_URL": "https://mapmycams.dev"
   },
+  // AI camera placement (POST /ai/suggest). The binding is the credential: no API
+  // key to create, nothing to be blocked by a country restriction, and the Workers
+  // Free plan includes 10,000 Neurons a day (roughly 100+ suggestions). Set
+  // GOOGLE_API_KEY as a secret instead/as well, and AI_PROVIDER to pin a provider.
+  "ai": {
+    "binding": "AI"
+  },
   // The mailer endpoint can send real email from the verified domain, so the
   // *.workers.dev and preview URLs are switched off: they are extra public
   // entry points that bypass the custom domain. The domain is a Custom Domain

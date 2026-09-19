@@ -23,6 +23,7 @@ import {
   emailConfigured, resendCooldownRemaining, CODE_TTL_MS, CODE_MAX_ATTEMPTS,
   json, cors, rateLimit,
 } from './_lib.js'
+import { suggestSpotsWithModel } from './ai.js'
 
 // Stripe price IDs come from env: PRICE_PREMIUM_MONTHLY, PRICE_PREMIUM_YEARLY,
 // PRICE_AI_PACK, PRICE_PDF_REPORT, PRICE_BRANDS. Family Sharing was dropped: the
@@ -397,9 +398,16 @@ async function handle(request, env) {
     const premium = user.plan?.startsWith('premium') || user.is_admin || (user.addons || []).includes('ai_pack')
     if (!premium) return json({ error: 'Premium feature' }, 402)
     if (!rateLimit(user.id, 10)) return json({ error: 'Rate limit exceeded, try again in a minute' }, 429)
-    const { walls, cameras } = await request.json()
-    // Server-side mirror of the client heuristic — kept simple on purpose.
-    return json({ spots: suggestSpots(walls || [], cameras || []) })
+    const { walls, cameras, objects } = await request.json()
+
+    // The model answers with positions inside the rooms it was shown; every one of
+    // them is validated and rebuilt as a camera in api/ai.js. When it cannot be
+    // used — no GOOGLE_API_KEY, a quota error, a retired model, a reply with
+    // nothing placeable — this falls back to the geometry solver rather than
+    // failing, and says which one answered so the app can show it.
+    const ai = await suggestSpotsWithModel(env, { walls: walls || [], cameras: cameras || [], objects: objects || [] })
+    if (ai) return json({ ...ai, source: 'model' })
+    return json({ spots: suggestSpots(walls || [], cameras || []), source: 'solver' })
   }
 
   // ── Analytics ──────────────────────────────────────────────────────────────
@@ -459,7 +467,15 @@ function suggestSpots(walls, cameras) {
     const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys)
     for (const [x, y] of [[minX + 8, minY + 8], [maxX - 8, maxY - 8]]) {
       if ([...cameras, ...spots].some((c) => Math.hypot(c.x - x, c.y - y) < 120)) continue
-      spots.push({ x, y, rotation: (Math.atan2((minY + maxY) / 2 - y, (minX + maxX) / 2 - x) * 180) / Math.PI, hFov: 120, distance: Math.hypot(maxX - minX, maxY - minY) / 2 + 40, label: 'AI Cam' })
+      spots.push({
+        id: `ai_${crypto.randomUUID().slice(0, 8)}`,
+        x, y,
+        rotation: Math.round((Math.atan2((minY + maxY) / 2 - y, (minX + maxX) / 2 - x) * 180) / Math.PI),
+        hFov: 120,
+        distance: Math.min(40, Math.max(2, Math.round((Math.hypot(maxX - minX, maxY - minY) / 2 + 40) / 40))),
+        color: '#38bdf8',
+        label: `AI Cam ${spots.length + 1}`,
+      })
     }
   }
   return spots

@@ -11,7 +11,10 @@
     "email:test": "node scripts/test-email.mjs",
     "stripe:setup": "node scripts/stripe-setup.mjs",
     "billing:test": "node scripts/test-billing.mjs",
-    "checkout:test": "node scripts/test-checkout-client.mjs"
+    "checkout:test": "node scripts/test-checkout-client.mjs",
+    "landing:test": "node scripts/test-landing.mjs",
+    "ai:test": "node scripts/test-ai.mjs",
+    "ai:key": "node scripts/push-ai-key.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",

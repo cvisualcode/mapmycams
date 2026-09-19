@@ -6,6 +6,8 @@
 import { useEffect, useState } from 'react'
 import { EntitlementsProvider, useEntitlements } from './monetisation/EntitlementsContext'
 import { LoginScreen, VerifyEmailScreen, Dashboard, PricingPage, AdminPanel, UpgradeModal, CheckoutGate } from './monetisation/MonetisationUI'
+import LandingPage from './monetisation/LandingPage'
+import { visitorRoute } from './monetisation/routing'
 import { buildFloorplanSnapshot } from './monetisation/snapshotBridge'
 import { readSharedPlan } from './monetisation/share'
 import EditorApp from './App.jsx'
@@ -14,6 +16,12 @@ function MonetisedApp() {
   const ent = useEntitlements()
   const [view, setView] = useState('dashboard') // dashboard | editor | pricing | admin
   const [loadedPlan, setLoadedPlan] = useState(null)
+  // null while the public home page is showing; 'login' / 'signup' once the
+  // visitor has chosen a way in. Signed-out visitors land on the home page, not
+  // straight on a password form.
+  const [authTab, setAuthTab] = useState(null)
+  // The public home page, reachable from the dashboard header too.
+  const [showHome, setShowHome] = useState(false)
   // A plan opened from a shared #plan=… link, edited as a copy of itself.
   const [sharedPlan, setSharedPlan] = useState(null)
 
@@ -29,8 +37,12 @@ function MonetisedApp() {
   }, [])
 
   if (ent.loading) return <div className="auth-screen"><p>Loading…</p></div>
+
+  // One decision, one place: verify the emailed code, sign in, or read the home
+  // page. See monetisation/routing.js.
+  const visitor = ent.user ? 'app' : visitorRoute(ent, authTab)
   // Half-registered account: the only reachable screen is the code entry.
-  if (!ent.user && ent.pendingEmail) {
+  if (visitor === 'verify') {
     return (
       <VerifyEmailScreen
         email={ent.pendingEmail}
@@ -42,7 +54,11 @@ function MonetisedApp() {
       />
     )
   }
-  if (!ent.user) return <LoginScreen />
+  if (visitor !== 'app') {
+    return visitor === 'auth'
+      ? <LoginScreen key={authTab} initialTab={authTab} onBack={() => setAuthTab(null)} />
+      : <LandingPage onSignIn={() => setAuthTab('login')} onSignUp={() => setAuthTab('signup')} />
+  }
 
   function openPlan(fp) {
     setSharedPlan(null)
@@ -57,6 +73,13 @@ function MonetisedApp() {
     }
     setLoadedPlan(null)
     setSharedPlan(null)
+    setView('editor')
+  }
+
+  /** Back into the app from the home page, straight into the planner. */
+  function openPlanner() {
+    setShowHome(false)
+    setLoadedPlan(null)
     setView('editor')
   }
 
@@ -95,6 +118,11 @@ function MonetisedApp() {
       </>
     )
   }
+  // The home page is public: a signed-in customer can read it (and is offered a
+  // way back into the planner instead of a sign-up button).
+  if (showHome) {
+    return <LandingPage signedIn onOpenApp={() => setShowHome(false)} onOpenPlanner={openPlanner} />
+  }
   if (view === 'pricing') return <><PricingPage onBack={() => setView('dashboard')} />{overlays}</>
   if (view === 'admin') return <AdminPanel onBack={() => setView('dashboard')} />
   return (
@@ -102,8 +130,9 @@ function MonetisedApp() {
       <Dashboard
         onOpenPlan={openPlan}
         onNewPlan={newPlan}
-        onOpenEditor={() => { setLoadedPlan(null); setView('editor') }}
+        onOpenEditor={openPlanner}
         onPricing={() => setView('pricing')}
+        onHome={() => setShowHome(true)}
         onAdmin={() => setView('admin')}
       />
       {overlays}

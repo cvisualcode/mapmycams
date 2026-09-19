@@ -345,7 +345,68 @@ PRICE_FAMILY=price_...
 PRICE_BRANDS=price_...
 APP_URL=https://mapmycams.dev
 ALLOWED_ORIGIN=https://mapmycams.dev
+GOOGLE_API_KEY=...                 # optional: only if you want Gemini instead of Workers AI
+GEMINI_MODEL=gemini-3.8-flash      # optional: pin a Gemini model instead of picking one live
+AI_PROVIDER=workers-ai             # optional: pin the provider (workers-ai | gemini)
 ```
+
+There is no key for the default AI provider: it runs on the `AI` binding in
+`wrangler.jsonc` (Cloudflare Workers AI), which is part of the Workers account this
+app already deploys to — nothing to sign up for and nothing to be blocked by a
+country restriction. The Workers Free plan includes 10,000 Neurons a day, which is
+roughly a hundred suggestions.
+
+## AI camera placement (the thing the AI pack sells)
+
+`POST /ai/suggest` is Premium (or the one-off AI pack) and rate-limited to 10 calls a
+minute per account. It sends the plan's rooms, entry points and existing cameras to a
+model and asks only for positions and reasons:
+
+```
+{"spots":[{"room":0,"x":120,"y":340,"rotation":180,"distance":8,"why":"covers the front door"}],"summary":"..."}
+```
+
+Everything else is ours. **A position the model returns is only used if it lands
+inside the room it names** — validated in `api/ai.js` against the same polygons the
+prompt was built from — and the camera object (id, label, colour, view angle, clamped
+range, spacing from any camera already placed) is built by the server, never by the
+model. A reply that is prose, fenced JSON, out of bounds, or full of positions that
+are all rejected counts as no answer at all.
+
+When there is no answer — no provider configured, a quota error, a retired model name,
+a timeout — the endpoint falls back to its own geometry and sets `source: "solver"`. The
+editor only swaps in an answer marked `source: "model"`; otherwise it uses its own
+in-browser solver, which is better than the server's crude one, so the button always
+produces a layout and the toolbar says which engine produced it ("✨ AI layout").
+
+### Providers
+
+Two, tried in order, both behind the same validation:
+
+1. **Cloudflare Workers AI** — the `AI` binding. The default because there is nothing
+to configure and nothing to lose: no key, no separate account, no country
+restriction, and the Workers Free plan's 10,000 Neurons a day covers roughly a
+hundred suggestions. Models are tried in preference order and the one that answers is
+remembered per isolate, so a model being retired degrades to the next name.
+2. **Google Gemini** — only when `GOOGLE_API_KEY` is set. Useful if you already have a
+key; Google AI Studio is region-restricted for some accounts, which is what makes
+option 1 the default. `bun run ai:key` pushes the key straight to the Worker as a
+secret and never prints it, and `bun run ai:test` covers it with Gemini stubbed.
+
+`AI_PROVIDER=gemini` or `AI_PROVIDER=workers-ai` pins one; with both configured, a
+provider that fails falls through to the other before the geometry solver is used.
+
+### Verifying
+
+```
+bun run ai:test           # 57 checks, both providers stubbed — no key, no quota, no network
+```
+
+It covers the paid gate (401/402 with no model call made), the prompt (room polygons,
+coordinate convention, entries, cameras already placed, JSON-only instruction), both
+reply shapes, a retired model name, an exhausted allowance, a reply that is prose, a
+position outside the house, a duplicate position, the rate limit, the validation rules
+in isolation and the provider preference.
 
 ## Upsell triggers (implemented)
 
