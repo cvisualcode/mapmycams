@@ -132,5 +132,25 @@ console.log('\nA room that needs repairing renders')
   check('a plan with an unnamed room and a stray wall renders', !error, error && error.message)
 }
 
+console.log('\nThe API the browser talks to')
+{
+  // The Pages host has no API of its own: its build bakes VITE_API_URL in and every call
+  // goes to the Worker instead. Anything that hardcodes a relative path is dead on that
+  // host — which is exactly how an error reporter that never reported anything would
+  // behave — so the setting is checked rather than assumed.
+  const { readFileSync } = await import('node:fs')
+  const build = (outDir, apiUrl) => {
+    execFileSync(process.execPath, [
+      'node_modules/vite/bin/vite.js', 'build', '--ssr', 'src/monetisation/errors.js',
+      '--outDir', outDir, '--logLevel', 'warn',
+    ], { stdio: ['ignore', 'ignore', 'inherit'], env: { ...process.env, VITE_API_URL: apiUrl } })
+    return readFileSync(`${outDir}/errors.js`, 'utf8')
+  }
+  const staticHost = build('node_modules/.cache/ssr-api', 'https://mapmycams.dev')
+  check('a static host reports to the API it was built for', staticHost.includes('mapmycams.dev') && /report-error/.test(staticHost))
+  const sameOrigin = build('node_modules/.cache/ssr-api-relative', '')
+  check('and a build with no API configured stays on its own origin', !sameOrigin.includes('mapmycams.dev') && /report-error/.test(sameOrigin))
+}
+
 console.log(failures === 0 ? '\nEditor smoke checks passed.\n' : `\n${failures} editor smoke check(s) failed.\n`)
 process.exit(failures === 0 ? 0 : 1)

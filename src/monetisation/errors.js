@@ -15,8 +15,15 @@
 // matter can happen anywhere — including on the sign-in screen, before any session
 // exists.
 
-/** The route on the API. Relative, so it works on the Worker and on a static host. */
-const REPORT_URL = '/report-error'
+/**
+ * Where the API is. Relative by default, because the Worker serves both the app and the
+ * API from one origin; a static host (the Pages build) has no API of its own, so it
+ * bakes VITE_API_URL in and points here at the Worker instead — the same setting
+ * api.js reads for every other call. Without this, a report from the Pages host would
+ * be posted to a route that host does not serve and thrown away.
+ */
+const API_BASE = ((typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL) || '').replace(/\/+$/, '')
+const REPORT_URL = `${API_BASE}/report-error`
 
 /** Per page load: never more than this many reports, and never the same one twice. */
 const MAX_REPORTS = 6
