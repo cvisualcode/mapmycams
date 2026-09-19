@@ -12,6 +12,8 @@ import {
   PIXELS_PER_METER, lineOfSightBlocked, computeBlindSpots, cameraSeesPoint, computeHealthScore, scoreBand, isPointInPolygon, objectCentre, clickHitsWallShape,
   roomContaining, isOpeningPoint, polygonArea, coverageCheck, scoreWithAreaCoverage, describeBlindSpots, drawBlindSpots, toCanvas,
   OBJECT_PRESETS, SINGLE_SHOT_PRESETS, isSingleShot, shouldDisarmAfterPlacement, drawObject,
+  objectRotateHandlePoint, isOnObjectRotateHandle, angleAbout, rotationFromDrag, toObjectFrame,
+  ROTATE_GRIP_PX,
 } from '../src/editor/plan-drawing.js'
 
 let failures = 0
@@ -246,6 +248,36 @@ check('…and turns when it is rotated', rotation && Math.abs(rotation.args[0] -
 const straightCtx = stubCtx()
 drawObject(straightCtx, { ...stair, rotation: 0 }, atOrigin, atOrigin, 1, [hall])
 check('…and not when it is not', straightCtx.calls.find((c) => c.name === 'rotate').args[0] === 0)
+
+// ── Turning an object ────────────────────────────────────────────────────────
+// A turned object has to be grabbable where it is drawn, and every one of these is the
+// same rectangle seen three times: the shape that is drawn, the shape a press lands on,
+// and the shape a drag turns about its centre.
+console.log('\nTurning what is on the plan')
+const turnable = { id: 7, presetId: 'stairs-straight', x: m(3), y: m(3), width: 1.1, height: 0.35, rotation: 0 }
+const gripAt = (rotation) => objectRotateHandlePoint({ ...turnable, rotation }, [], atOrigin, atOrigin, 1)
+check('a stair offers a grip to turn it', Boolean(gripAt(0)))
+check('the grip sits clear of its edge', Math.abs(Math.hypot(gripAt(0).x - gripAt(0).centre.x, gripAt(0).y - gripAt(0).centre.y) - (m(1.1) / 2 + ROTATE_GRIP_PX)) < 1e-9)
+check('the grip travels with the object', Math.abs(gripAt(90).y - gripAt(90).centre.y) > 40 && Math.abs(gripAt(90).x - gripAt(90).centre.x) < 1e-9, JSON.stringify(gripAt(90)))
+check('a press on the grip is a press on the grip', isOnObjectRotateHandle(gripAt(45).x, gripAt(45).y, { ...turnable, rotation: 45 }, [], atOrigin, atOrigin, 1))
+check('a press a long way off it is not', !isOnObjectRotateHandle(gripAt(45).x + 40, gripAt(45).y, { ...turnable, rotation: 45 }, [], atOrigin, atOrigin, 1))
+// A window is a span along a wall and a door carries its own hinge handle, so neither
+// should grow a second one for the same job.
+check('a window has no grip of its own', objectRotateHandlePoint({ id: 8, presetId: 'window', wallId: 'w', t1: 0.2, t2: 0.5 }, [hall], atOrigin, atOrigin, 1) === null)
+check('a door has no grip of its own', objectRotateHandlePoint({ id: 9, presetId: 'door', x: m(3), y: m(3), rotation: 0 }, [], atOrigin, atOrigin, 1) === null)
+check('something with no place on the plan has no grip', objectRotateHandlePoint({ id: 10, presetId: 'safe' }, [], atOrigin, atOrigin, 1) === null)
+
+check('an angle is measured about the object, not the origin', angleAbout({ x: 0, y: 0 }, { x: 0, y: 10 }) === 90)
+check('…and never comes back negative', angleAbout({ x: 0, y: 0 }, { x: -10, y: 0 }) === 180 && angleAbout({ x: 0, y: 0 }, { x: 0, y: -4 }) === 270)
+check('grabbing a grip does not snap the object to the pointer', rotationFromDrag(0, 200, 200) === 0)
+check('a quarter turn is a quarter turn', rotationFromDrag(0, 0, 90) === 90)
+check('…in either direction', rotationFromDrag(0, 90, 0) === 270)
+check('…and past a full turn it comes back round', rotationFromDrag(350, 0, 20) === 10)
+check('half a degree of drag is not half a degree of plan', rotationFromDrag(0, 0, 44.6) === 45)
+// Into the object's own frame: what was to the east of it is along its width when it lies
+// at 0°, and along its height once it has been turned a quarter turn.
+const frame = toObjectFrame({ x: m(1), y: 0 }, { x: 0, y: 0 }, 90)
+check('a point a metre east is measured along the object\'s width', Math.abs(frame.x) < 1e-9 && Math.abs(frame.y + m(1)) < 1e-9, JSON.stringify(frame))
 // Sockets and safes are drawn as their box, so what is drawn and what is clickable are
 // the same rectangle — the whole reason picking can work off the object's size.
 const safeCtx = stubCtx()

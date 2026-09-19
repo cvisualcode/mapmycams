@@ -11,6 +11,7 @@ import { visitorRoute } from './monetisation/routing'
 import { buildFloorplanSnapshot } from './monetisation/snapshotBridge'
 import { readSharedPlan } from './monetisation/share'
 import EditorApp from './App.jsx'
+import EditorMobileMenu from './editor/mobile-menu.jsx'
 
 function MonetisedApp() {
   const ent = useEntitlements()
@@ -105,15 +106,19 @@ function MonetisedApp() {
   if (view === 'editor') {
     return (
       <>
-        <EditorApp
+        {/* The editor's toolbar collapses into a menu on a phone. See
+            src/editor/mobile-menu.jsx for why this lives beside the editor. */}
+        <EditorMobileMenu>
+          <EditorApp
           // Remounting is what gives the editor new starting state, since the
           // snapshot is only read when it mounts. Without a key, opening a saved
           // plan from the dashboard left the editor empty.
           key={loadedPlan ? `plan-${loadedPlan.id}` : sharedPlan ? 'shared-plan' : 'new-plan'}
-          initialSnapshot={sharedPlan || (loadedPlan ? loadedPlan.data : null)}
-          onExit={exitEditor}
-          showUpgrade={(title, reason, item) => ent.promptUpgrade(title, reason, item || 'premium_monthly')}
-        />
+            initialSnapshot={sharedPlan || (loadedPlan ? loadedPlan.data : null)}
+            onExit={exitEditor}
+            showUpgrade={(title, reason, item) => ent.promptUpgrade(title, reason, item || 'premium_monthly')}
+          />
+        </EditorMobileMenu>
         {overlays}
       </>
     )

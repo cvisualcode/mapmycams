@@ -61,6 +61,10 @@ import {
   scoreBand,
   openingSpan,
   shouldDisarmAfterPlacement,
+  objectRotateHandlePoint,
+  isOnObjectRotateHandle,
+  angleAbout,
+  rotationFromDrag,
 } from './editor/plan-drawing'
 
 // Ids for cameras, objects, walls and wires. Module scope so two items placed in
@@ -510,9 +514,95 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     return true
   }
 
+  /** The camera within the standard 12 px press radius of a canvas point, if any. */
+  function cameraNearCanvas(c) {
+    for (const cam of cameras) {
+      const cp = toCanvas(cam.x, cam.y, origin, pan, zoom)
+      if (Math.hypot(c.x - cp.x, c.y - cp.y) < 12) return cam
+    }
+    return null
+  }
+
+  /**
+   * A press on the grip of the selected object starts turning it, to any angle.
+   *
+   * The 90° button is for squaring something to a wall; this is for lining a flight of
+   * stairs up with a diagonal hall, which no number of right angles can do. Because the
+   * grip is what is being grabbed, the press must not reach the editor — selecting,
+   * moving or deselecting instead — so this runs before the press is delegated.
+   *
+   * Answers true when the press has been taken.
+   */
+  function startObjectTurn(event) {
+    if (rotateDrag) return false
+    // A right-click is not a press on the plan anywhere else either.
+    if (event.pointerType === 'mouse' && event.button !== 0) return false
+    const target = selectedObject
+    if (!target || target.wallId != null) return false
+    const c = getMouseCanvas(event)
+    // A camera under the grip keeps the press: it is the smaller, harder target.
+    if (cameraNearCanvas(c)) return false
+    if (!isOnObjectRotateHandle(c.x, c.y, target, walls, origin, pan, zoom)) return false
+    const world = getMouseWorld(event)
+    setRotateDrag({
+      type: 'rotateObject',
+      objectId: target.id,
+      centerX: target.x,
+      centerY: target.y,
+      startAngle: angleAbout(target, world),
+      startRotation: target.rotation || 0,
+    })
+    setToolNotice('Turning — drag round to the angle you want, then let go. The Rotate button still steps a right angle.')
+    return true
+  }
+
+  /**
+   * The turn, driven from here rather than from the editor's own move handler.
+   *
+   * The handler that turns doors clamps them to 90° either way, which is right for a door
+   * on a hinge and wrong for a stair, so this drag is deliberately kept away from it.
+   */
+  function applyObjectTurn(event) {
+    if (!rotateDrag || rotateDrag.type !== 'rotateObject') return false
+    const angleNow = angleAbout({ x: rotateDrag.centerX, y: rotateDrag.centerY }, getMouseWorld(event))
+    const rotation = rotationFromDrag(rotateDrag.startRotation, rotateDrag.startAngle, angleNow)
+    setObjects((prev) => prev.map((o) => (o.id === rotateDrag.objectId ? { ...o, rotation } : o)))
+    setSelectedObject((prev) => (prev && prev.id === rotateDrag.objectId ? { ...prev, rotation } : prev))
+    return true
+  }
+
+  /**
+   * A press on a *turned* object selects it, which the editor's own upright rectangle test
+   * cannot do.
+   *
+   * A stair is 1.1 m by 0.35 m; turned on its side it stands 0.35 m by 1.1 m on the plan,
+   * and the old test went on looking for it lying down — so after turning one it could not
+   * be selected, dragged or turned again, which is the same as not being turnable at all.
+   * A camera within 12 px still wins, and an object lying at 0° or 180° is left to the
+   * ordinary test, which is already right about it.
+   */
+  function selectTurnedObject(event) {
+    if (mode !== 'select') return false
+    if (event.pointerType === 'mouse' && event.button !== 0) return false
+    const c = getMouseCanvas(event)
+    if (cameraNearCanvas(c)) return false
+    const world = getMouseWorld(event)
+    const hit = findPlacedObjectAt(world, objects, walls, zoom, 0)
+    if (!hit || hit.wallId != null) return false
+    if (hit.presetId === 'window' || hit.presetId === 'door') return false
+    if (((hit.rotation || 0) % 180) === 0) return false
+    setSelectedObject(hit)
+    setSelectedRoom(null)
+    setSelectedCamera(null)
+    setDrag({ type: 'moveObject', objectId: hit.id, startX: world.x, startY: world.y })
+    return true
+  }
+
   function handlePointerDown(event) {
     const outcome = pointerDown(touchRef.current, event)
     if (outcome.action === 'mouseDown') {
+      if (startObjectTurn(event)) return
+      if (selectTurnedObject(event)) return
       if (selectPlacedObjectInstead(event, true)) return
       latestHandlersRef.current.mouseDown(event)
       return
@@ -532,6 +622,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   function handlePointerMove(event) {
     const outcome = pointerMove(touchRef.current, event)
     if (outcome.action === 'mouseMove') {
+      if (applyObjectTurn(event)) return
       latestHandlersRef.current.mouseMove(event)
       return
     }
@@ -546,9 +637,13 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     if (outcome.action === 'pressThenMove') {
       // A finger that has travelled is a drag, so picking up what is under it beats
       // putting another one down on top of it. The lift that follows clears the drag.
-      if (!selectPlacedObjectInstead(asMouseEvent(event, outcome.point), true)) {
-        latestHandlersRef.current.mouseDown(asMouseEvent(event, outcome.point))
-      }
+      // The press is tested where the finger *landed*, not where it has got to, or a grip
+      // that has already been left behind would never be grabbed.
+      const press = asMouseEvent(event, outcome.point)
+      if (startObjectTurn(press)) return
+      if (selectTurnedObject(press)) return
+      if (selectPlacedObjectInstead(press, true)) return
+      latestHandlersRef.current.mouseDown(press)
       latestHandlersRef.current.mouseMove(event)
     }
   }
@@ -736,6 +831,10 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
 
   const [size, setSize] = useState({ width: 800, height: 600 })
   const previousMode = useRef(mode)
+  // Placing a stair hands straight over to Select with the stair still selected, and the
+  // mode change that follows would otherwise wipe the selection it was handed — leaving a
+  // stair nobody could turn, because the thing you turn is the thing that is selected.
+  const keepSelectionOnModeChange = useRef(false)
 
   useEffect(() => {
     if (previousMode.current === 'wall' && mode !== 'wall' && currentWall) {
@@ -747,6 +846,13 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       setCurrentWall(null)
     }
     previousMode.current = mode
+    if (keepSelectionOnModeChange.current && mode === 'select') {
+      keepSelectionOnModeChange.current = false
+      setSelectedCamera(null)
+      setRotateDrag(false)
+      setDrag(null)
+      return
+    }
     setSelectedCamera(null)
     setSelectedObject(null)
     setRotateDrag(false)
@@ -893,10 +999,11 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     placedCountRef.current = objects.length
     const last = objects[objects.length - 1]
     if (!shouldDisarmAfterPlacement({ added, mode, armedPresetId: activeObjectPreset.id, placedPresetId: last && last.presetId })) return
+    keepSelectionOnModeChange.current = true
     armSelect()
     setSelectedObject(last)
     const preset = OBJECT_PRESETS.find((p) => p.id === last.presetId)
-    setToolNotice(`${preset ? preset.label : 'Placed'} placed and selected — turn it to suit the house, then tap the tool again for the next one.`)
+    setToolNotice(`${preset ? preset.label : 'Placed'} placed and selected — drag the blue grip to turn it, then tap the tool again for the next one.`)
   }, [objects, mode, activeObjectPreset])
 
   useEffect(() => {
@@ -1137,9 +1244,34 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
           // room is, whatever the zoom.
           const w = Math.max((obj.width || preset.width) * PIXELS_PER_METER * zoom, 14)
           const h = Math.max((obj.height || preset.height) * PIXELS_PER_METER * zoom, 14)
-          ctx.strokeRect(cp.x - w / 2, cp.y - h / 2, w, h)
+          // Turned with the object, so a stair lying on its side is marked where it is
+          // drawn rather than where it used to lie.
+          ctx.save()
+          ctx.translate(cp.x, cp.y)
+          ctx.rotate(((obj.rotation || 0) * Math.PI) / 180)
+          ctx.strokeRect(-w / 2, -h / 2, w, h)
+          ctx.restore()
         }
         ctx.setLineDash([])
+        // The grip that turns it, on its stem, so a turned object shows where to grab it.
+        const grip = objectRotateHandlePoint(obj, walls, origin, pan, zoom)
+        if (grip) {
+          ctx.setLineDash([3, 3])
+          ctx.strokeStyle = '#3b82f6'
+          ctx.lineWidth = 1.5
+          ctx.beginPath()
+          ctx.moveTo(grip.centre.x, grip.centre.y)
+          ctx.lineTo(grip.x, grip.y)
+          ctx.stroke()
+          ctx.setLineDash([])
+          ctx.beginPath()
+          ctx.arc(grip.x, grip.y, 7, 0, Math.PI * 2)
+          ctx.fillStyle = '#3b82f6'
+          ctx.fill()
+          ctx.strokeStyle = '#fff'
+          ctx.lineWidth = 2
+          ctx.stroke()
+        }
         // Door selection visuals are drawn separately above when `selectedObject` is a door
       }
     }

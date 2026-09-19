@@ -967,6 +967,74 @@ export function openingSpan(obj, walls) {
   }
 }
 
+// ── Turning what is on the plan ──────────────────────────────────────────────
+// An object's rectangle knows nothing about its `rotation`, so everything that has to
+// cope with a turned object has to turn the *point* instead: into the object's own frame
+// to ask whether a press lands on it, and about its centre to work out how far a drag has
+// swung it. Both are here, next to the drawing, because the drawn shape, the shape you
+// can press and the shape a drag turns are all the same rectangle.
+
+/** How far clear of the object's edge its rotation grip floats, in screen pixels. */
+export const ROTATE_GRIP_PX = 18
+
+/** How near the grip a press counts as grabbing it, in screen pixels. */
+export const ROTATE_GRIP_SLACK_PX = 14
+
+/** A point in the object's own frame: +x along its width, +y along its height. */
+export function toObjectFrame(world, centre, rotation) {
+  const a = (-(rotation || 0) * Math.PI) / 180
+  const dx = world.x - centre.x
+  const dy = world.y - centre.y
+  return {
+    x: dx * Math.cos(a) - dy * Math.sin(a),
+    y: dx * Math.sin(a) + dy * Math.cos(a),
+  }
+}
+
+/**
+ * Where the grip that turns this object sits, in canvas pixels, or null when it has none.
+ *
+ * A window is a span along a wall and a door already carries a hinge handle, so neither
+ * gets one. Everything else hangs its grip off the right-hand edge, so it travels with the
+ * object as it turns — which is the whole point of a grip.
+ */
+export function objectRotateHandlePoint(obj, walls, origin, pan, zoom) {
+  if (!obj || obj.wallId != null) return null
+  const preset = OBJECT_PRESETS.find((p) => p.id === obj.presetId)
+  if (!preset || preset.id === 'window' || preset.id === 'door') return null
+  if (typeof obj.x !== 'number' || typeof obj.y !== 'number') return null
+  const cp = toCanvas(obj.x, obj.y, origin, pan, zoom)
+  const halfW = Math.max((obj.width || preset.width) * PIXELS_PER_METER * zoom, 14) / 2
+  const handleAngle = ((obj.rotation || 0) * Math.PI) / 180
+  const reach = halfW + ROTATE_GRIP_PX
+  return { x: cp.x + Math.cos(handleAngle) * reach, y: cp.y + Math.sin(handleAngle) * reach, centre: cp }
+}
+
+/** Is a press at this canvas point on the object's rotation grip? */
+export function isOnObjectRotateHandle(canvasX, canvasY, obj, walls, origin, pan, zoom, slackPx = ROTATE_GRIP_SLACK_PX) {
+  const grip = objectRotateHandlePoint(obj, walls, origin, pan, zoom)
+  if (!grip) return false
+  return Math.hypot(canvasX - grip.x, canvasY - grip.y) <= slackPx
+}
+
+/** The angle of a world point about a centre, in degrees, clockwise from due east. */
+export function angleAbout(centre, world) {
+  const degrees = (Math.atan2(world.y - centre.y, world.x - centre.x) * 180) / Math.PI
+  return ((degrees % 360) + 360) % 360
+}
+
+/**
+ * How far an object has turned, given where the drag started.
+ *
+ * Measured as the change of angle about the object's own centre rather than the angle
+ * itself, so the object does not jump to point at the pointer the moment it is grabbed,
+ * and rounded to whole degrees because a plan is drawn to centimetres, not to radians.
+ */
+export function rotationFromDrag(startRotation, startAngle, angleNow) {
+  const turned = (startRotation || 0) + (angleNow - startAngle)
+  return Math.round(((turned % 360) + 360) % 360)
+}
+
 /**
  * Is this position in the plan one of the holes a door or window makes in a wall?
  *

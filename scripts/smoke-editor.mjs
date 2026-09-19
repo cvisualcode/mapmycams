@@ -72,6 +72,13 @@ console.log('\nThe editor renders')
   check('an empty plan renders without throwing', !error, error && error.message)
   check('the canvas is there', typeof html === 'string' && html.includes('<canvas'))
   check('the toolbar is there', html.includes('>Select<'))
+  // The phone layout is CSS keyed on these class names — the bar becomes one swiping
+  // strip and the menu is the same controls expanded. The CSS cannot fail loudly if a
+  // name goes away, so this is where a rename would show up.
+  check(
+    'the bar still carries the names the phone layout is written against',
+    ['class="toolbar"', 'class="tools"', 'class="controls"', 'class="floor-switch"'].every((name) => html.includes(name)),
+  )
   check('undo and redo are offered', html.includes('Undo') && html.includes('Redo'))
   check('every sidebar tab is offered', ['Cameras', 'Objects', 'Score', 'Tools'].every((t) => html.includes(`>${t}<`)))
   check('the AI button is offered', html.includes('AI Place Cameras'))
@@ -130,6 +137,32 @@ console.log('\nA room that needs repairing renders')
     error = e
   }
   check('a plan with an unnamed room and a stray wall renders', !error, error && error.message)
+}
+
+console.log('\nThe phone menu renders')
+{
+  // Built and rendered on its own: it wraps the editor, so a mistake in it is a blank
+  // page on exactly the devices it exists for.
+  execFileSync(process.execPath, [
+    'node_modules/vite/bin/vite.js', 'build', '--ssr', 'src/editor/mobile-menu.jsx',
+    '--outDir', 'node_modules/.cache/ssr-menu', '--logLevel', 'warn',
+  ], { stdio: ['ignore', 'ignore', 'inherit'] })
+  let html = ''
+  let error = null
+  try {
+    const { default: EditorMobileMenu } = await import(pathToFileURL(`${process.cwd()}/node_modules/.cache/ssr-menu/mobile-menu.js`).href)
+    html = renderToString(React.createElement(
+      EditorMobileMenu,
+      null,
+      React.createElement('div', { className: 'toolbar' }, React.createElement('div', { className: 'tools' }, 'Select'), React.createElement('div', { className: 'controls' }, 'Export PNG')),
+    ))
+  } catch (e) {
+    error = e
+  }
+  check('the menu wrapper renders without throwing', !error, error && error.message)
+  check('the wrapper the CSS hangs the layout on is there', html.includes('class="editor-shell"'))
+  check('the button starts closed', html.includes('class="mobile-more"') && html.includes('aria-expanded="false"'))
+  check('the editor is still rendered inside it', html.includes('class="toolbar"') && html.includes('Export PNG'))
 }
 
 console.log('\nThe API the browser talks to')

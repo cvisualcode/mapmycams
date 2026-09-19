@@ -555,6 +555,10 @@
   .toolbar {
     display: none;
   }
+  /* Printed from a phone, which is the only place the menu button exists. */
+  .mobile-more {
+    display: none;
+  }
   .app {
     height: auto;
   }
@@ -894,20 +898,114 @@
   .landing-note { margin-top: -18px; text-align: left; }
 }
 
+/* The wrapper the editor is mounted in, so the ⋯ More button has something to sit on and
+   something to put `menu-open` on. It takes no space of its own. */
+.editor-shell {
+  position: relative;
+}
+
+/* The button exists at every width so the markup is the same everywhere; only a phone
+   shows it, where it floats over the free right-hand end of the bar. */
+.mobile-more {
+  display: none;
+}
+
 /* ── The planner on a phone, or a tablet held in one hand ─────────────────────
-   The toolbar is the only chrome on screen, so it may take as many rows as it needs
-   and every control is a finger-sized target. Hints get a row to themselves rather
-   than squeezing the buttons beside them, and the sidebar becomes a full-width sheet
-   instead of a 310px column over a 150px-wide plan. */
+   The bar is five rows of chrome on a phone: four floors, the current tool's actions,
+   the AI, the blind-spot report and five export buttons, over a plan the size of a
+   postcard. So the tools keep the top row, the rest of the bar becomes a single strip
+   that swipes sideways, and the ⋯ More button drops the whole of it open as a menu when
+   you want to see every control at once. Nothing is ever hidden — the strip scrolls, and
+   the menu is the same controls laid out in full. */
 @media (max-width: 720px) {
-  .toolbar { gap: 6px; padding: 6px 8px; }
-  .tools,
-  .controls { gap: 6px; width: 100%; }
+  .toolbar {
+    gap: 6px;
+    padding: 6px 8px;
+    /* For the menu dropping out from under it. */
+    position: relative;
+  }
+  .tools { gap: 6px; }
   .toolbar button { padding: 9px 12px; }
-  .toolbar .hint { flex-basis: 100%; margin: 0; }
-  .toolbar .room-name input { width: 120px; }
+
+  /* One row that swipes, rather than five that wrap. `.floor-switch` goes last: floors
+     are the least-used thing up here, and putting them at the end means "Finish Wall"
+     is the first thing on the strip whenever a wall is being drawn. */
+  .controls {
+    order: 3;
+    flex: 1 1 100%;
+    flex-wrap: nowrap;
+    gap: 6px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    padding-bottom: 3px;
+    scrollbar-width: none;
+    /* The fade at the right edge is the only hint a swiping strip can give, and it is
+       additive to the scrolling rather than a substitute for it. */
+    -webkit-mask-image: linear-gradient(90deg, #000 0 88%, transparent 100%);
+    mask-image: linear-gradient(90deg, #000 0 88%, transparent 100%);
+  }
+  .controls::-webkit-scrollbar { display: none; }
+  .controls > * { flex: 0 0 auto; }
+  .controls .floor-switch { order: 1; }
+  .toolbar .hint {
+    flex: 0 0 auto;
+    max-width: 62vw;
+    margin: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .toolbar .room-name input { width: 110px; }
   .sidebar { width: 100%; }
   .zoom-controls button { width: 44px; height: 44px; }
+
+  /* The bar's own right-hand end is where the ⋯ More button floats. */
+  .mobile-more {
+    display: inline-flex;
+    align-items: center;
+    position: absolute;
+    top: 7px;
+    right: max(8px, env(safe-area-inset-right));
+    z-index: 30;
+    background: #1e293b;
+    color: #f8fafc;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 9px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .editor-shell.menu-open .mobile-more {
+    background: #3b82f6;
+    border-color: #60a5fa;
+  }
+
+  /* The same controls, all of them at once, over the plan. */
+  .editor-shell.menu-open .controls {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    overflow: visible;
+    max-height: 62vh;
+    overflow-y: auto;
+    padding: 10px;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 25;
+    background: #0f172a;
+    border-top: 1px solid #1e293b;
+    box-shadow: 0 18px 34px rgba(2, 6, 23, .45);
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+  /* Open, the floors go back to the front, where the bar itself puts them, and the
+     notices get the whole width to wrap into — in a menu there is room to read them. */
+  .editor-shell.menu-open .controls .floor-switch { order: 0; }
+  .editor-shell.menu-open .controls .hint {
+    max-width: 100%;
+    white-space: normal;
+  }
 }
 
 /* A finger is not a mouse: a keyboard-sized button is a miss waiting to happen. Keyed

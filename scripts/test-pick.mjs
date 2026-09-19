@@ -62,6 +62,18 @@ check('a tap away from the door span misses it', findPlacedObjectAt({ x: m(5), y
 check('a window is picked along its own span', findPlacedObjectAt({ x: m(1.2 + 1.8), y: m(6) }, wallObjects, [hall]) === window_)
 check('the nearer of a wall object and a free one wins', findPlacedObjectAt({ x: m(3), y: m(2.9) }, [safe, door], [hall]) === safe)
 
+console.log('\nA turned object')
+// The stair from the fixtures above, stood on its side. It is 1.1 m across and 0.35 m
+// deep lying down, so turned a quarter turn it stands 0.35 m across and 1.1 m deep — and
+// a press has to find it there, or turning one leaves it unselectable, undraggable and
+// therefore unturnable again.
+const turned = { id: 4, presetId: 'stairs-straight', x: m(3), y: m(3), width: 1.1, height: 0.35, rotation: 90 }
+check('a turned stair is picked where its ends now are', findPlacedObjectAt({ x: m(3), y: m(3.4) }, [turned], [hall]) === turned)
+check('…and the long side it used to have is no longer its shape', findPlacedObjectAt({ x: m(3.4), y: m(3) }, [turned], [hall]) === null)
+check('a quarter turn is not a half turn', findPlacedObjectAt({ x: m(3), y: m(3.4) }, [{ ...turned, rotation: 180 }], [hall]) === null)
+check('a diagonal flight is picked along its diagonal', findPlacedObjectAt({ x: m(3) - m(0.3), y: m(3) - m(0.3) }, [{ ...turned, rotation: 45 }], [hall]) !== null)
+check('…and not off the corner it has left behind', findPlacedObjectAt({ x: m(3) + m(0.45), y: m(3) - m(0.45) }, [{ ...turned, rotation: 45 }], [hall]) === null)
+
 console.log('\nEvery preset')
 // A guard rail worth having: shrink an object far enough and it stops being pickable at
 // all, which is how a "scale it down" request quietly breaks selection on a phone. The

@@ -14,7 +14,7 @@
 //   bun run pick:test
 
 import {
-  OBJECT_PRESETS, PIXELS_PER_METER, distanceToSegment, objectCentre,
+  OBJECT_PRESETS, PIXELS_PER_METER, distanceToSegment, objectCentre, toObjectFrame,
 } from './plan-drawing.js'
 
 /** How far from an object a tap still counts as hitting it, in screen pixels. */
@@ -51,9 +51,14 @@ export function distanceToObject(world, obj, walls) {
   if (!centre) return null
   const halfW = ((obj.width || preset.width) * PIXELS_PER_METER) / 2
   const halfH = ((obj.height || preset.height) * PIXELS_PER_METER) / 2
-  // Straight-line gap to the rectangle, which is zero inside it.
-  const gapX = Math.max(Math.abs(world.x - centre.x) - halfW, 0)
-  const gapY = Math.max(Math.abs(world.y - centre.y) - halfH, 0)
+  // Straight-line gap to the rectangle, which is zero inside it — measured in the object's
+  // own frame, so a stair turned on its side is picked where it is drawn. Testing the
+  // upright rectangle instead would look for a flight 1.1 m across and 0.35 m deep when
+  // what is on the plan is 0.35 m across and 1.1 m deep, and a press on either end of it
+  // would fall through to the room behind.
+  const local = toObjectFrame(world, centre, obj.rotation)
+  const gapX = Math.max(Math.abs(local.x) - halfW, 0)
+  const gapY = Math.max(Math.abs(local.y) - halfH, 0)
   return Math.hypot(gapX, gapY)
 }
 
