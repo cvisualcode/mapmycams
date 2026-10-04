@@ -15,6 +15,11 @@ const here = dirname(fileURLToPath(import.meta.url))
 const SUITES = [
   ['rooms:test', 'test-rooms.mjs'],
   ['history:test', 'test-history.mjs'],
+  ['save:test', 'test-save.mjs'],
+  ['walls:test', 'test-walls.mjs'],
+  ['calibration:test', 'test-calibration.mjs'],
+  ['quality:test', 'test-quality.mjs'],
+  ['shares:test', 'test-shares.mjs'],
   ['gestures:test', 'test-gestures.mjs'],
   ['duplicate:test', 'test-duplicate.mjs'],
   ['pick:test', 'test-pick.mjs'],
@@ -25,6 +30,7 @@ const SUITES = [
   ['checkout:test', 'test-checkout-client.mjs'],
   ['reset:test', 'test-reset.mjs'],
   ['visibility:test', 'test-visibility.mjs'],
+  ['demo-admin:test', 'test-demo-admin.mjs'],
   ['landing:test', 'test-landing.mjs'],
   ['smoke:test', 'smoke-editor.mjs'],
 ]

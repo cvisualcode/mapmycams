@@ -19,6 +19,19 @@ import { PIXELS_PER_METER, isPointInPolygon, objectCentre, lineOfSightBlocked } 
 
 /** How much a target is worth. A door is the thing you most want watched; an outlet
  *  matters mainly because a camera needs power nearby. */
+// How much a room matters beyond what stands in it. Modest by design: an entrance
+// or a garage is where intrusion happens, a bedroom is not somewhere to watch.
+// Weights are multiplied by these and then capped, so one risky target can never
+// force a camera on its own.
+export const ROOM_RISK_MULTIPLIERS = {
+  general: 1, entrance: 1.6, hallway: 1.25, living: 1.1, bedroom: 0.8, kitchen: 1, garage: 1.5, storage: 1.4,
+}
+export const MAX_TARGET_WEIGHT = 8
+
+export function roomRiskMultiplier(roomType) {
+  return ROOM_RISK_MULTIPLIERS[roomType] ?? 1
+}
+
 export const PRIORITY_WEIGHTS = {
   door: 4,
   safe: 3,
@@ -98,7 +111,7 @@ export function buildTargets(rooms, objects = []) {
     for (let x = minX + CELL / 2; x < maxX; x += CELL) {
       for (let y = minY + CELL / 2; y < maxY; y += CELL) {
         if (!isPointInPolygon(x, y, room.points)) continue
-        targets.push({ x, y, weight: FLOOR_WEIGHT, kind: 'floor', room })
+        targets.push({ x, y, weight: Math.min(MAX_TARGET_WEIGHT, FLOOR_WEIGHT * roomRiskMultiplier(room.roomType)), kind: 'floor', room })
       }
     }
   }
@@ -109,12 +122,13 @@ export function buildTargets(rooms, objects = []) {
     if (weight === 0) continue
     const centre = objectCentre(o, rooms)
     if (!centre) continue
-    targets.push({ x: centre.x, y: centre.y, weight, kind: o.presetId, room: rooms.find((r) => isPointInPolygon(centre.x, centre.y, r.points)) || null })
+    const home = rooms.find((r) => isPointInPolygon(centre.x, centre.y, r.points)) || null
+    targets.push({ x: centre.x, y: centre.y, weight: Math.min(MAX_TARGET_WEIGHT, weight * roomRiskMultiplier(home?.roomType)), kind: o.presetId, room: home })
     // The area around it is worth as much: you want the approach to the door, not
     // just the door frame.
     for (const t of targets) {
       if (t.kind !== 'floor') continue
-      if (Math.hypot(t.x - centre.x, t.y - centre.y) <= radius) t.weight = Math.max(t.weight, weight)
+      if (Math.hypot(t.x - centre.x, t.y - centre.y) <= radius) t.weight = Math.max(t.weight, Math.min(MAX_TARGET_WEIGHT, weight * roomRiskMultiplier(t.room?.roomType)))
     }
   }
   return targets

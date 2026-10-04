@@ -30,12 +30,14 @@ export function LoginScreen({ initialTab = 'login', onBack }) {
   const [showPassword, setShowPassword] = useState(false)
   // Empty unless this browser is refusing to store data — see api.storageNotice().
   const storageWarning = api.storageNotice()
-  // True once the account service answers here. The demo Admin account is a
-  // development tool, so it is only offered where there is nothing to sign in to.
-  const [hasApi, setHasApi] = useState(false)
+  // The demo Admin account is a development tool, so it is offered only where the
+  // host has *confirmed* it has no account service ('no-api'). It starts as
+  // 'unknown' and stays hidden: on the live site it must never flash into view,
+  // and a failed probe is not permission to hand out full access.
+  const [apiMode, setApiMode] = useState('unknown')
   useEffect(() => {
     let live = true
-    api.apiAvailable().then((ok) => { if (live) setHasApi(ok) })
+    api.apiProbeResult().then((mode) => { if (live) setApiMode(mode) })
     return () => { live = false }
   }, [])
 
@@ -110,7 +112,7 @@ export function LoginScreen({ initialTab = 'login', onBack }) {
           <button className="auth-btn" disabled={busy}>{busy ? 'Please wait…' : tab === 'login' ? 'Sign in' : 'Create account'}</button>
         </form>
 
-        {!hasApi && (
+        {apiMode === 'no-api' && (
           <button className="auth-admin" onClick={demoAdmin} title="Pre-built full-access admin account — Admin / Admin1">
             ⭐ Sign in as Admin (Admin / Admin1)
           </button>
@@ -683,6 +685,25 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing, onHo
   const { buy, busy, notice, dismiss } = useCheckout()
   const [billing, setBilling] = useState([])
   const [twoFA, setTwoFA] = useState(false)
+  const [planBusy, setPlanBusy] = useState(null)
+  const [planError, setPlanError] = useState('')
+  async function managePlan(plan, action) {
+    if (planBusy) return
+    if (action === 'delete' && !window.confirm(`Delete “${plan.name}”? This cannot be undone.`)) return
+    const name = action === 'rename' ? window.prompt('Plan name', plan.name) : `${plan.name} (copy)`
+    if (action === 'rename' && !name?.trim()) return
+    if (action === 'duplicate' && ent.floorplans.length >= ent.limits.floorplans) {
+      ent.promptUpgrade('Save more floorplans', 'Upgrade to duplicate this plan without replacing the original.', 'premium_monthly')
+      return
+    }
+    setPlanBusy(plan.id)
+    setPlanError('')
+    try {
+      if (action === 'delete') await ent.deleteFloorplan(plan.id)
+      else await ent.saveFloorplan(name.trim().slice(0, 120), plan.data, action === 'rename' ? plan.id : crypto.randomUUID())
+    } catch (error) { setPlanError(error.message) }
+    finally { setPlanBusy(null) }
+  }
 
   useEffect(() => {
     api.getBilling().then(setBilling).catch(() => setBilling([]))
@@ -719,6 +740,7 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing, onHo
         )}
         <section className="dash-card">
           <h3>Your floorplans</h3>
+          {planError && <p role="alert">{planError}</p>}
           <p className="spec-hint">{ent.limits.floorplans === Infinity ? 'Unlimited' : `${ent.floorplans.length} of ${ent.limits.floorplans} saved (Free tier)`}</p>
           <div className="fp-list">
             {ent.floorplans.length === 0 && <p className="spec-hint">No saved floorplans yet.</p>}
@@ -727,7 +749,10 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing, onHo
                 <span className="fp-name">{f.name || 'Untitled plan'}</span>
                 <span className="fp-date">{new Date(f.updated).toLocaleDateString()}</span>
                 <button onClick={() => onOpenPlan(f)}>Open</button>
-                <button className="danger" onClick={() => ent.deleteFloorplan(f.id)}>Delete</button>
+                {f.pendingSync && <span>Pending sync</span>}
+                <button disabled={!!planBusy} onClick={() => managePlan(f, 'rename')}>Rename</button>
+                <button disabled={!!planBusy} onClick={() => managePlan(f, 'duplicate')}>Duplicate</button>
+                <button disabled={!!planBusy} className="danger" onClick={() => managePlan(f, 'delete')}>Delete</button>
               </div>
             ))}
           </div>

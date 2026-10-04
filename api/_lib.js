@@ -263,6 +263,84 @@ export async function deleteFloorplan(ownerId, id) {
   await store().delete(planKey(ownerId, id))
 }
 
+// ── Shared plan links ─────────────────────────────────────────────────────────
+// A share is an immutable snapshot published under a random capability code. It is
+// a separate record from the editable plan, so a later edit cannot rewrite what a
+// client was shown, and revoking it cannot damage the plan itself.
+
+const shareKey = (code) => `share:${code}`
+const shareCommentsKey = (code) => `share-comments:${code}`
+const shareOpensKey = (code) => `share-opens:${code}`
+
+/** 128 bits of entropy, url-safe. */
+export function shareCode() {
+  const bytes = new Uint8Array(18)
+  crypto.getRandomValues(bytes)
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+export async function saveShare(record) {
+  requireConfig()
+  await store().put(shareKey(record.code), JSON.stringify(record))
+  return record
+}
+
+export async function getShare(code) {
+  requireConfig()
+  return (await store().get(shareKey(String(code)), 'json')) || null
+}
+
+export async function deleteShare(code) {
+  requireConfig()
+  await store().delete(shareKey(String(code)))
+}
+
+export async function listShares(ownerId) {
+  requireConfig()
+  const { keys } = await store().list({ prefix: 'share:', limit: 1000 })
+  const rows = await Promise.all(keys.map((k) => store().get(k.name, 'json')))
+  return rows.filter((row) => row && row.owner === ownerId).sort((a, b) => (b.created || 0) - (a.created || 0))
+}
+
+export async function listShareComments(code) {
+  requireConfig()
+  return (await store().get(shareCommentsKey(String(code)), 'json')) || []
+}
+
+export async function saveShareComments(code, comments) {
+  requireConfig()
+  await store().put(shareCommentsKey(String(code)), JSON.stringify(comments))
+  return comments
+}
+
+/** Open counts are best effort by design — KV has no atomic counter. */
+export async function countShareOpen(code) {
+  requireConfig()
+  const key = shareOpensKey(String(code))
+  const count = Number(await store().get(key)) || 0
+  await store().put(key, String(count + 1))
+  return count + 1
+}
+
+export async function shareOpenCount(code) {
+  requireConfig()
+  return Number(await store().get(shareOpensKey(String(code)))) || 0
+}
+
+/** The printable report email. Same Resend transport as the verification codes. */
+export async function sendReportEmail(email, { title, summary, url }) {
+  return sendCodeEmail(email, {
+    subject: `Security plan report: ${String(title).slice(0, 80)}`,
+    html: [
+      '<h2 style="font-family:sans-serif">Your security plan report is ready</h2>',
+      `<p style="font-family:sans-serif">${String(summary).slice(0, 600)}</p>`,
+      `<p style="font-family:sans-serif"><a href="${url}">Open the printable report</a></p>`,
+      '<p style="font-family:sans-serif;color:#64748b">The report opens read-only. Use your browser\'s print dialog to save it as a PDF.</p>',
+    ].join(''),
+    text: `Security plan report: ${url}`,
+  })
+}
+
 // ── Feature flags ────────────────────────────────────────────────────────────
 
 /**

@@ -558,7 +558,7 @@ export function drawSegmentLine(ctx, p1, p2, origin, pan, zoom) {
   ctx.lineTo(c2.x, c2.y)
   ctx.strokeStyle = '#111827'
   ctx.lineWidth = 3 * zoom
-  ctx.lineCap = 'round'
+  ctx.lineCap = 'butt'
   ctx.stroke()
 }
 
@@ -785,9 +785,9 @@ export function findNearestWallSegment(world, walls, origin, pan, zoom, maxPx = 
  * wall too. `slackPx` is deliberately small, so an outlet or a safe standing against
  * a wall still wins its own click.
  */
-export function clickHitsWallShape(world, points, origin, pan, zoom, slackPx = 9) {
+export function clickHitsWallShape(world, points, origin, pan, zoom, slackPx = 9, closed = true) {
   if (!Array.isArray(points) || points.length < 2) return false
-  const shape = { id: 'shape', closed: true, points }
+  const shape = { id: 'shape', closed, points }
   return findNearestWallSegment(world, [shape], origin, pan, zoom, slackPx) !== null
 }
 
@@ -857,7 +857,31 @@ export function drawDoorOnWallSegment(ctx, x1, y1, x2, y2, rotation, origin, pan
   ctx.stroke()
 }
 
-export function drawWall(ctx, wall, origin, pan, zoom, objects) {
+export function wallOpeningIntervals(a, b, walls, objects = []) {
+  const dx = b.x - a.x, dy = b.y - a.y, length = Math.hypot(dx, dy)
+  if (!length) return []
+  const spans = []
+  for (const object of objects) {
+    const span = openingSpan(object, walls)
+    if (!span) continue
+    const cross = p => Math.abs(dx * (p.y - a.y) - dy * (p.x - a.x)) / length
+    if (cross(span.a) > 0.01 || cross(span.b) > 0.01) continue
+    const project = p => ((p.x - a.x) * dx + (p.y - a.y) * dy) / (length * length)
+    const low = Math.max(0, Math.min(project(span.a), project(span.b)))
+    const high = Math.min(1, Math.max(project(span.a), project(span.b)))
+    if (high > low) spans.push([low, high])
+  }
+  spans.sort((x, y) => x[0] - y[0])
+  const merged = []
+  for (const span of spans) {
+    const last = merged.at(-1)
+    if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1])
+    else merged.push([...span])
+  }
+  return merged
+}
+
+export function drawWall(ctx, wall, origin, pan, zoom, objects, allWalls = [wall]) {
   if (wall.points.length < 2) return
   const windows = objects.filter((obj) => obj.presetId === 'window' && obj.wallId === wall.id)
   const doors = objects.filter((obj) => obj.presetId === 'door' && obj.wallId === wall.id)
@@ -875,14 +899,16 @@ export function drawWall(ctx, wall, origin, pan, zoom, objects) {
       .filter((obj) => obj.segmentIndex === i)
       .sort((a, b) => a.t1 - b.t1)
 
-    let lastT = 0
+    const intervals = wallOpeningIntervals(p1, p2, allWalls, objects)
+    const at = t => ({ x: p1.x + (p2.x - p1.x) * t, y: p1.y + (p2.y - p1.y) * t })
+    let end = 0
+    for (const [low, high] of intervals) {
+      if (low > end) drawSegmentLine(ctx, at(end), at(low), origin, pan, zoom)
+      end = high
+    }
+    if (end < 1) drawSegmentLine(ctx, at(end), p2, origin, pan, zoom)
     const allSegments = [...segmentWindows, ...segmentDoors]
     for (const segObj of allSegments) {
-      const segStart = { x: p1.x + (p2.x - p1.x) * lastT, y: p1.y + (p2.y - p1.y) * lastT }
-      const segEnd = { x: p1.x + (p2.x - p1.x) * segObj.t1, y: p1.y + (p2.y - p1.y) * segObj.t1 }
-      if (Math.hypot(segEnd.x - segStart.x, segEnd.y - segStart.y) > 0.001) {
-        drawSegmentLine(ctx, segStart, segEnd, origin, pan, zoom)
-      }
       if (segObj.presetId === 'window') {
         drawWindowOnWallSegment(ctx, p1.x + (p2.x - p1.x) * segObj.t1, p1.y + (p2.y - p1.y) * segObj.t1,
           p1.x + (p2.x - p1.x) * segObj.t2, p1.y + (p2.y - p1.y) * segObj.t2,
@@ -891,15 +917,6 @@ export function drawWall(ctx, wall, origin, pan, zoom, objects) {
         drawDoorOnWallSegment(ctx, p1.x + (p2.x - p1.x) * segObj.t1, p1.y + (p2.y - p1.y) * segObj.t1,
           p1.x + (p2.x - p1.x) * segObj.t2, p1.y + (p2.y - p1.y) * segObj.t2,
           segObj.rotation, origin, pan, zoom, segObj.hingeSide)
-      }
-      lastT = segObj.t2
-    }
-
-    if (lastT < 1) {
-      const segStart = { x: p1.x + (p2.x - p1.x) * lastT, y: p1.y + (p2.y - p1.y) * lastT }
-      const segEnd = p2
-      if (Math.hypot(segEnd.x - segStart.x, segEnd.y - segStart.y) > 0.001) {
-        drawSegmentLine(ctx, segStart, segEnd, origin, pan, zoom)
       }
     }
   }
@@ -1108,7 +1125,10 @@ export function boxCutsSight(camX, camY, targetX, targetY, cx, cy, halfW, halfH)
  * Can a camera here see that point, as far as walls, doors and furniture are
  * concerned? Range and field of view are the caller's business — see cameraSeesPoint.
  */
-export function lineOfSightBlocked(camX, camY, targetX, targetY, walls, objects) {
+export const DEFAULT_CAMERA_HEIGHT_M = 2.5
+export const DEFAULT_TARGET_HEIGHT_M = 1.5
+
+export function lineOfSightBlocked(camX, camY, targetX, targetY, walls, objects, options = {}) {
   const all = walls || []
   const camRoom = roomContaining(camX, camY, all)
   const interior = camRoom !== null && camRoom === roomContaining(targetX, targetY, all)
@@ -1143,10 +1163,34 @@ export function lineOfSightBlocked(camX, camY, targetX, targetY, walls, objects)
     if (!obj.blocksVision) continue
     const centre = objectCentre(obj, all)
     if (!centre) continue
+    // Height-aware obstruction: a safe the camera looks over is not a wall. The
+    // sight-line height is read where the ray passes the obstruction; an object
+    // with no height recorded stays conservative and blocks as before.
+    const obstructionHeightM = Number(obj.obstructionHeightM)
+    if (Number.isFinite(obstructionHeightM)) {
+      const rayX = targetX - camX, rayY = targetY - camY
+      const length2 = rayX * rayX + rayY * rayY
+      const t = length2 > 0
+        ? Math.max(0, Math.min(1, ((centre.x - camX) * rayX + (centre.y - camY) * rayY) / length2))
+        : 0
+      const cameraHeightM = Number.isFinite(options.cameraHeightM) ? options.cameraHeightM : DEFAULT_CAMERA_HEIGHT_M
+      const targetHeightM = Number.isFinite(options.targetHeightM) ? options.targetHeightM : DEFAULT_TARGET_HEIGHT_M
+      const sightHeight = cameraHeightM + (targetHeightM - cameraHeightM) * t
+      if (obstructionHeightM < sightHeight) continue
+    }
     const preset = OBJECT_PRESETS.find((p) => p.id === obj.presetId)
     const halfW = ((obj.width || preset?.width || 1) * PIXELS_PER_METER) / 2
     const halfH = ((obj.height || preset?.height || 1) * PIXELS_PER_METER) / 2
-    if (boxCutsSight(camX, camY, targetX, targetY, centre.x, centre.y, halfW, halfH)) return true
+    // The ray is tested in the object's own axes, so a turned wardrobe blocks
+    // where it is drawn rather than in an upright box it does not occupy.
+    const rot = ((obj.rotation || 0) * Math.PI) / 180
+    const cos = Math.cos(-rot), sin = Math.sin(-rot)
+    const intoFrame = (x, y) => ({
+      x: (x - centre.x) * cos - (y - centre.y) * sin + centre.x,
+      y: (x - centre.x) * sin + (y - centre.y) * cos + centre.y,
+    })
+    const a = intoFrame(camX, camY), b = intoFrame(targetX, targetY)
+    if (boxCutsSight(a.x, a.y, b.x, b.y, centre.x, centre.y, halfW, halfH)) return true
   }
   return false
 }

@@ -16,6 +16,10 @@ import {
 } from './editor/pointer-gestures'
 import { duplicateCamera, duplicateObject } from './editor/duplicate'
 import { findPlacedObjectAt } from './editor/pick'
+import { constrainPoint, canCloseWall } from './editor/constraints'
+import { calibratePlan, measureDistance } from './editor/calibration'
+import { computeCoverageQuality, describeCoverageQuality, DEFAULT_RESOLUTION_PIXELS } from './editor/quality'
+import { ROOM_RISK_MULTIPLIERS } from './editor/coverage-plan'
 import './App.css'
 import {
   PIXELS_PER_METER,
@@ -96,10 +100,14 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   // opened from the dashboard puts its upper floors back too, and a plan saved before
   // this read the flat shape, which is read as the ground floor it was drawn on.
   const [openedPlan] = useState(() => normalizePlanData(snap, FLOOR_NAMES.length))
+  const [calibration, setCalibration] = useState(openedPlan.calibration)
+  const [measurePoints, setMeasurePoints] = useState([])
+  const [measuring, setMeasuring] = useState(false)
   const openedFloor = openedPlan.floors[openedPlan.activeFloor]
   const [walls, setWalls] = useState(() => openedFloor.walls)
   const [cameras, setCameras] = useState(() => openedFloor.cameras)
   const [currentWall, setCurrentWall] = useState(null)
+  const [angleLock, setAngleLock] = useState(false)
   const [rectStart, setRectStart] = useState(null)
   const [rectEnd, setRectEnd] = useState(null)
   const [wires, setWires] = useState(() => openedFloor.wires)
@@ -133,6 +141,9 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   const [specFov, setSpecFov] = useState(90)
   const [specResolution, setSpecResolution] = useState(RESOLUTIONS[1])
   const [specGoal, setSpecGoal] = useState(DETECTION_LEVELS[0])
+  // What the coverage map is graded against, and whether it paints the plan.
+  const [coverageGoal, setCoverageGoal] = useState(DETECTION_LEVELS[0])
+  const [showQuality, setShowQuality] = useState(false)
 
   // ── Monetisation hooks (provided by AppShell's EntitlementsProvider) ──
   // Every paid capability the tool offers is gated on the entitlement that sells
@@ -222,6 +233,9 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   // The coverage line is re-scored by area, from the sampler's own numbers, so the
   // score panel, the red patches and the toolbar summary cannot disagree.
   const health = showSidebar && sideTab === 'score' ? scoreWithAreaCoverage(computeHealthScore(walls, cameras, objects, wires), walls) : null
+  const quality = showSidebar && sideTab === 'score'
+    ? computeCoverageQuality(walls, cameras, objects, { goal: coverageGoal })
+    : null
   const healthMax = health ? health.checks.reduce((sum, check) => sum + check.max, 0) : 0
   const healthBand = health ? scoreBand(healthMax > 0 ? Math.round((health.score / healthMax) * 100) : 0) : null
 
@@ -353,7 +367,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
 
   /** Every floor, as one string. What an undo step actually restores. */
   function planSnapshotNow() {
-    return serializePlan({ floors: planFloors(), activeFloor })
+    return serializePlan({ floors: planFloors(), activeFloor, calibration })
   }
 
   function setHistoryFlagsFor(canUndo, canRedo) {
@@ -373,6 +387,10 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
 
   /** Put a snapshot back on screen. Nothing half-finished survives a restore. */
   function applyPlan(plan) {
+    setCalibration(plan.calibration || null)
+    setAiBlindSpots([])
+    setMeasurePoints([])
+    setMeasuring(false)
     setDrag(null)
     setRotateDrag(false)
     setResizing(null)
@@ -473,7 +491,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       button: 0,
       buttons: 1,
       altKey: false,
-      shiftKey: false,
+      shiftKey: !!event.shiftKey,
       metaKey: false,
       ctrlKey: false,
       pointerType: event.pointerType,
@@ -846,9 +864,8 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   useEffect(() => {
     if (previousMode.current === 'wall' && mode !== 'wall' && currentWall) {
       if (currentWall.points.length >= 2) {
-        // Keep the shape that was on screen while drawing: the preview closes the
-        // loop, so the wall it becomes closes it too.
-        setWalls((prev) => [...prev, { ...currentWall, closed: true }])
+        // A tool switch commits the open path, without adding a final segment.
+        setWalls((prev) => [...prev, { ...currentWall, closed: false }])
       }
       setCurrentWall(null)
     }
@@ -930,7 +947,14 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   // plan — a layout that came back with nothing in it. The floors that are not on screen
   // are the ones `flushActiveFloor` keeps, and they go in the same document.
   useEffect(() => {
-    const wholePlan = () => planDocument({ floors: planFloors(), activeFloor })
+    const wholePlan = () => {
+      const floors = planFloors()
+      const here = floors[activeFloor]
+      floors[activeFloor] = { ...here,
+        walls: currentWall?.points.length >= 2 ? [...here.walls, { ...currentWall, closed: false }] : here.walls,
+        wires: currentWire?.points.length >= 2 ? [...here.wires, { ...currentWire }] : here.wires }
+      return planDocument({ floors, activeFloor, calibration })
+    }
     window.__mmcGetSnapshot = wholePlan
     // The share link builds its own flat copy from the floor on screen, so the app hands
     // it the whole plan through the same kind of hook.
@@ -939,6 +963,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       const plan = normalizePlanData(snapshot, FLOOR_NAMES.length)
       const here = plan.floors[plan.activeFloor]
       floorsRef.current = { ...plan.floors }
+      setCalibration(plan.calibration)
       setActiveFloor(plan.activeFloor)
       setWalls(here.walls)
       setCameras(here.cameras)
@@ -946,6 +971,10 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       setWires(here.wires)
     }
   })
+
+  useEffect(() => {
+    window.dispatchEvent(new Event('mmc:plan-changed'))
+  }, [walls, cameras, objects, wires, activeFloor, currentWall, currentWire, calibration])
 
   // Whatever route a plan arrived by — drawn here, restored from the dashboard, or a
   // shared #plan= link — its rooms get a name that is present and unique before anything
@@ -976,7 +1005,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     return () => {
       if (historyTimerRef.current) clearTimeout(historyTimerRef.current)
     }
-  }, [walls, cameras, objects, wires, activeFloor])
+  }, [walls, cameras, objects, wires, activeFloor, calibration])
 
   // Anything the toolbar has to say clears itself, so it cannot go stale.
   useEffect(() => {
@@ -1068,9 +1097,16 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     }
     // The plan's scale, on the canvas: nothing else tells you what a metre is here.
     drawScaleBar(ctx, w, h, zoom)
+    if (measurePoints.length === 2) {
+      const a = toCanvas(measurePoints[0].x, measurePoints[0].y, origin, pan, zoom)
+      const b = toCanvas(measurePoints[1].x, measurePoints[1].y, origin, pan, zoom)
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y)
+      ctx.strokeStyle = '#0284c7'; ctx.lineWidth = 2; ctx.stroke()
+      ctx.fillStyle = '#0284c7'; ctx.fillText(`${measureDistance(...measurePoints).toFixed(2)} m`, (a.x+b.x)/2, (a.y+b.y)/2-8)
+    }
 
     walls.forEach((wall, i) => {
-      drawWall(ctx, wall, origin, pan, zoom, objects)
+      drawWall(ctx, wall, origin, pan, zoom, objects, walls)
       drawRoomLabel(ctx, wall, origin, pan, zoom, roomDisplayName(wall, i))
     })
     if (currentWall) {
@@ -1123,6 +1159,18 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     // Areas the cameras miss, painted under the cones and the camera markers, so what
     // the report claims and what the plan shows are the same thing seen twice.
     if (aiBlindSpots.length > 0) drawBlindSpots(ctx, aiBlindSpots, origin, pan, zoom)
+    if (showQuality && quality) {
+      // The coverage map, painted from the same sampler the score quotes: green
+      // meets the goal, amber is visible but too grainy, red is blind.
+      const tone = { met: 'rgba(34,197,94,0.28)', below: 'rgba(245,158,11,0.32)', blind: 'rgba(239,68,68,0.32)' }
+      for (const room of quality.rooms) {
+        for (const cell of room.cells) {
+          const c = toCanvas(cell.x, cell.y, origin, pan, zoom)
+          ctx.fillStyle = tone[cell.quality]
+          ctx.fillRect(c.x - (room.cell * zoom) / 2, c.y - (room.cell * zoom) / 2, room.cell * zoom, room.cell * zoom)
+        }
+      }
+    }
     for (const cam of cameras) {
       const cp = toCanvas(cam.x, cam.y, origin, pan, zoom)
       drawFovShape(ctx, cam, origin, pan, zoom, walls, objects, currentWall ? [currentWall] : [], activeFloor === FLOOR_NAMES.length - 1, ghostWalls, ghostHull)
@@ -1351,14 +1399,14 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
         const p = toCanvas(walls[selectedRoom].points[i].x, walls[selectedRoom].points[i].y, origin, pan, zoom)
         ctx.lineTo(p.x, p.y)
       }
-      ctx.closePath()
+      if (walls[selectedRoom].closed !== false) ctx.closePath()
       ctx.strokeStyle = '#ef4444'
       ctx.lineWidth = 3
       ctx.setLineDash([6, 4])
       ctx.stroke()
       ctx.setLineDash([])
       ctx.fillStyle = 'rgba(239, 68, 68, 0.1)'
-      ctx.fill()
+      if (walls[selectedRoom].closed !== false) ctx.fill()
     }
 
     if (rectStart && rectEnd) {
@@ -1377,6 +1425,12 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     }
 
     if (currentWall) {
+      if (hoveredPoint && mode === 'wall') {
+        const a = toCanvas(currentWall.points.at(-1).x, currentWall.points.at(-1).y, origin, pan, zoom)
+        const b = toCanvas(hoveredPoint.x, hoveredPoint.y, origin, pan, zoom)
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y)
+        ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 2; ctx.stroke()
+      }
       const last = currentWall.points[currentWall.points.length - 1]
       const lastC = toCanvas(last.x, last.y, origin, pan, zoom)
       ctx.beginPath()
@@ -1395,7 +1449,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       ctx.stroke()
       ctx.setLineDash([])
     }
-  }, [walls, currentWall, cameras, pan, zoom, origin, mode, size, placingCamera, selectedCamera, rectStart, rectEnd, objects, placingObject, selectedRoom, hoveredPoint, activeObjectPreset, selectedObject, windowDrag, wires, wireSnap, currentWire, activeFloor, viewportTick])
+  }, [walls, currentWall, cameras, pan, zoom, origin, mode, size, placingCamera, selectedCamera, rectStart, rectEnd, objects, placingObject, selectedRoom, hoveredPoint, activeObjectPreset, selectedObject, windowDrag, wires, wireSnap, currentWire, activeFloor, viewportTick, measurePoints, showQuality, quality])
   function getMouseWorld(e) {
     const canvas = canvasRef.current
     const rect = canvas.getBoundingClientRect()
@@ -1438,13 +1492,16 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
    * unselectable — any click inside it grabbed the whole room first.
    */
   function isPointInPolygon(x, y, polygon) {
-    return clickHitsWallShape({ x, y }, polygon, origin, pan, zoom, WALL_CLICK_PX)
+    const wall = walls.find(candidate => candidate.points === polygon)
+    return clickHitsWallShape({ x, y }, polygon, origin, pan, zoom, WALL_CLICK_PX, wall?.closed !== false)
   }
 
   return (
     <div className="app">
       <div className="toolbar">
         <div className="tools">
+          <button aria-pressed={measuring} onClick={() => { setMeasuring(value => !value); setMeasurePoints([]) }}>Measure</button>
+          {measurePoints.length === 2 && <span>{measureDistance(...measurePoints).toFixed(2)} m</span>}
           <button className={mode === 'select' ? 'active' : ''} onClick={armSelect} title="Select, move and rotate what is already on the plan (V)">
             Select
           </button>
@@ -1461,6 +1518,8 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
             <>
               <span className="hint">Click to add wall points</span>
               <button onClick={finishWall}>Finish Wall</button>
+              <button disabled={!canCloseWall(currentWall)} onClick={() => { setWalls(prev => [...prev, { ...currentWall, closed: true }]); setCurrentWall(null) }}>Close Room</button>
+              <button aria-pressed={angleLock} onClick={() => setAngleLock(value => !value)}>Angle lock {angleLock ? 'on' : 'off'}</button>
               <button onClick={cancelWall}>Cancel</button>
             </>
           )}
@@ -1497,12 +1556,42 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
               movable, rotatable and deletable from here. */}
           {selectedCamera && (
             <>
+              <label title="Sensor resolution — decides how far a face can be read">
+                Sensor:
+                <select value={selectedCamera.resolutionPixels || DEFAULT_RESOLUTION_PIXELS} onChange={(e) => {
+                  const resolutionPixels = Number(e.target.value)
+                  setCameras((prev) => prev.map((c) => (c.id === selectedCamera.id ? { ...c, resolutionPixels } : c)))
+                  setSelectedCamera((prev) => (prev ? { ...prev, resolutionPixels } : prev))
+                }}>
+                  {RESOLUTIONS.map((r) => <option key={r.id} value={r.px}>{r.label}</option>)}
+                </select>
+              </label>
+              <label title="Mounting height in metres — decides what it can look over">
+                Height (m):
+                <input type="number" min="0" max="15" step="0.1" defaultValue={selectedCamera.mountingHeightM ?? 2.5}
+                  onBlur={(e) => {
+                    const mountingHeightM = Number(e.target.value)
+                    setCameras((prev) => prev.map((c) => (c.id === selectedCamera.id ? { ...c, mountingHeightM } : c)))
+                    setSelectedCamera((prev) => (prev ? { ...prev, mountingHeightM } : prev))
+                  }} />
+              </label>
               <button onClick={duplicateSelection} title="Place another camera like this one (Ctrl+D)">Copy camera</button>
               <button onClick={deleteSelected}>Delete Camera</button>
             </>
           )}
           {selectedObject && (
             <>
+              <label title="How tall this is, in metres — a low safe is looked over, a tall wardrobe is not">
+                Height (m):
+                <input type="number" min="0" max="6" step="0.05" defaultValue={selectedObject.obstructionHeightM ?? ''}
+                  placeholder="blocks" title="Empty keeps the old behaviour: it blocks like a wall"
+                  onBlur={(e) => {
+                    const value = e.target.value.trim()
+                    const obstructionHeightM = value === '' ? undefined : Number(value)
+                    setObjects((prev) => prev.map((o) => (o.id === selectedObject.id ? { ...o, obstructionHeightM } : o)))
+                    setSelectedObject((prev) => (prev ? { ...prev, obstructionHeightM } : prev))
+                  }} />
+              </label>
               <button onClick={rotateSelectedObject}>Rotate 90°</button>
               <button onClick={duplicateSelection} title="Place another one of these (Ctrl+D)">Copy item</button>
               <button onClick={deleteSelected}>Delete Object</button>
@@ -1512,6 +1601,13 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
             <>
               {/* Uncontrolled and keyed by the room, so the box shows this room's name
                   and typing in it is never overwritten by a re-render mid-edit. */}
+              <button onClick={() => {
+                const wall = walls[selectedRoom]
+                const entered = window.prompt('Measured length of the first wall segment (metres)', measureDistance(wall.points[0], wall.points[1]).toFixed(2))
+                if (entered === null) return
+                try { commitHistory(); applyPlan(calibratePlan({ floors: planFloors(), activeFloor, calibration }, activeFloor, wall.id, 0, entered)); resetView() }
+                catch (error) { setToolNotice(error.message) }
+              }}>Calibrate scale</button>
               <label className="room-name">
                 Room:
                 <input
@@ -1524,6 +1620,15 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
                   onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
                   onBlur={(e) => renameSelectedRoom(e.currentTarget.value)}
                 />
+              </label>
+              <label title="What this room is for — it weights the recommendations and the score">
+                Type:
+                <select value={walls[selectedRoom]?.roomType || 'general'} onChange={(e) => {
+                  const roomType = e.target.value
+                  setWalls((prev) => prev.map((w, i) => (i === selectedRoom ? { ...w, roomType } : w)))
+                }}>
+                  {Object.keys(ROOM_RISK_MULTIPLIERS).map((type) => <option key={type} value={type}>{type}</option>)}
+                </select>
               </label>
               <button onClick={deleteSelectedRoom}>Delete Room</button>
             </>
@@ -1787,6 +1892,25 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
                 <div className="sidebar-header">
                   <h2>Security score</h2>
                 </div>
+                <section className="side-section">
+                  <h3>Coverage quality</h3>
+                  <label>
+                    Goal:
+                    <select value={coverageGoal.id} onChange={(e) => setCoverageGoal(DETECTION_LEVELS.find((l) => l.id === e.target.value))}>
+                      {DETECTION_LEVELS.map((l) => <option key={l.id} value={l.id}>{l.label} · {l.pxPerM} px/m</option>)}
+                    </select>
+                  </label>
+                  {quality && (
+                    <>
+                      <p className="spec-hint">{describeCoverageQuality(quality)}</p>
+                      {quality.usedDefaultResolution && <p className="spec-hint">Some cameras have no sensor set — counted at Full HD 1080p. Select one to change it.</p>}
+                      <button className="apply-btn" aria-pressed={showQuality} onClick={() => setShowQuality((value) => !value)}>
+                        {showQuality ? 'Hide' : 'Show'} coverage on plan
+                      </button>
+                      <p className="spec-hint">An estimate from lens, distance and heights — not a guarantee of face recognition, and it ignores lighting, glare and camera tilt.</p>
+                    </>
+                  )}
+                </section>
                 {scoreLocked ? (
                   <section className="side-section">
                     <h3>Premium feature</h3>
@@ -1962,7 +2086,25 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
       if (showUpgrade) showUpgrade('Shareable plan links', 'Send a link that opens this exact plan — floor by floor, cameras and all. Included with Premium.', 'premium_monthly')
       return
     }
-    const url = planShareUrl({ version: 1, walls, cameras, objects, wires }, window.location.href)
+    const snapshot = planDocument({ floors: planFloors(), activeFloor, calibration })
+    // Preferred: a short, revocable link on the hosted service. Where there is no
+    // service (the local preview) the old self-contained link still works.
+    let url = null
+    try {
+      const share = await api.createShare('My floorplan', snapshot)
+      if (share?.code) {
+        const base = window.location.href.split('?')[0].split('#')[0]
+        url = `${base}?share=${encodeURIComponent(share.code)}`
+      }
+    } catch (error) {
+      if (!/Premium/i.test(error.message)) {
+        url = planShareUrl(snapshot, window.location.href)
+      } else {
+        if (showUpgrade) showUpgrade('Shareable plan links', 'Short links clients can open and comment on. Included with Premium.', 'premium_monthly')
+        return
+      }
+    }
+    if (!url) return
     try {
       await navigator.clipboard.writeText(url)
       setToolNotice('Share link copied to the clipboard.')
@@ -2147,7 +2289,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     if (windowDrag) {
       const t1 = Math.min(windowDrag.startT, windowDrag.currentT)
       const t2 = Math.max(windowDrag.startT, windowDrag.currentT)
-      if (Math.abs(t2 - t1) > 0.02) {
+      if (Math.abs(t2 - t1) > 0.000001) {
         setObjects((prev) => [...prev, {
           id: nextId++,
           presetId: 'window',
@@ -2162,7 +2304,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
 
     if (placingObject) {
       if (placingObject.presetId === 'window' && placingObject.wallId != null) {
-        if (Math.abs(placingObject.t2 - placingObject.t1) > 0.02) {
+        if (Math.abs(placingObject.t2 - placingObject.t1) > 0.000001) {
           setObjects((prev) => [...prev, placingObject])
         }
       } else {
@@ -2216,7 +2358,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   function flushActiveFloor() {
     let fWalls = walls
     let fWires = wires
-    if (currentWall && currentWall.points.length >= 2) fWalls = [...walls, { ...currentWall, closed: true }]
+    if (currentWall && currentWall.points.length >= 2) fWalls = [...walls, { ...currentWall, closed: false }]
     if (currentWire && currentWire.points.length >= 2) fWires = [...wires, { ...currentWire }]
     floorsRef.current[activeFloor] = { walls: fWalls, cameras, objects, wires: fWires }
   }
@@ -2266,9 +2408,8 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
 
   function finishWall() {
     if (currentWall && currentWall.points.length >= 2) {
-      // `closed` matches what was on screen while clicking, so finishing a room
-      // does not drop the line that was completing it.
-      setWalls((prev) => [...prev, { ...currentWall, closed: true }])
+      // Finish commits the path; Close Room is the only automatic closing action.
+      setWalls((prev) => [...prev, { ...currentWall, closed: false }])
       setCurrentWall(null)
     }
   }
@@ -2278,6 +2419,10 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   }
 
   function handleMouseMove(e) {
+    if (mode === 'wall' && currentWall) {
+      const world = constrainPoint(currentWall.points.at(-1), getMouseWorld(e), angleLock || e.shiftKey)
+      setHoveredPoint(world)
+    }
     if (placingCamera) {
       const world = getMouseWorld(e)
       setPlacingCamera((prev) => prev ? { ...prev, x: world.x, y: world.y } : null)
@@ -2468,6 +2613,7 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
   }
 
   function handleMouseDown(e) {
+    if (measuring) { setMeasurePoints(prev => prev.length === 2 ? [getMouseWorld(e)] : [...prev, getMouseWorld(e)]); return }
     const world = getMouseWorld(e)
     const c = getMouseCanvas(e)
 
@@ -2642,14 +2788,15 @@ function App({ onExit, showUpgrade, initialSnapshot }) {
     }
 
     if (mode === 'wall') {
-      const sw = snapToBelowWorld({ x: world.x, y: world.y })
+      const sw = constrainPoint(currentWall?.points.at(-1), snapToBelowWorld({ x: world.x, y: world.y }), angleLock || e.shiftKey)
       setCurrentWall((prev) => {
         const points = prev ? [...prev.points, { x: sw.x, y: sw.y }] : [{ x: sw.x, y: sw.y }]
         return {
           id: prev?.id ?? nextId++,
           ...prev,
           points,
-          label: prev?.label || `Room ${walls.length + 1}`,
+          closed: false,
+          label: prev?.label || `Wall ${walls.length + 1}`,
         }
       })
       return

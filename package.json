@@ -5,6 +5,13 @@
   "type": "module",
   "scripts": {
     "test": "node scripts/test-all.mjs",
+    "save:test": "node scripts/test-save.mjs",
+    "walls:test": "node scripts/test-walls.mjs",
+    "calibration:test": "node scripts/test-calibration.mjs",
+    "quality:test": "node scripts/test-quality.mjs",
+    "shares:test": "node scripts/test-shares.mjs",
+    "browser:share": "node scripts/browser-share.mjs",
+    "browser:test": "node scripts/browser-save.mjs",
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
@@ -25,13 +32,15 @@
     "duplicate:test": "node scripts/test-duplicate.mjs",
     "pick:test": "node scripts/test-pick.mjs",
     "reset:test": "node scripts/test-reset.mjs",
-    "visibility:test": "node scripts/test-visibility.mjs"
+    "visibility:test": "node scripts/test-visibility.mjs",
+    "demo-admin:test": "node scripts/test-demo-admin.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.4",

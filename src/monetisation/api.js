@@ -450,13 +450,14 @@ function serverHeaders() {
   return { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }
 }
 
-async function api(path, body, method = 'POST') {
+async function api(path, body, method = 'POST', options = {}) {
   // Only talk to the server once it has issued a session. Before that the local
   // store is authoritative, which is what keeps the app fully usable when it is
   // not deployed anywhere.
   if (!serverToken()) throw new Error('demo')
   const res = await fetch(`${API_URL}${path}`, {
     method, headers: serverHeaders(), body: body ? JSON.stringify(body) : undefined,
+    keepalive: !!options.keepalive, signal: AbortSignal.timeout(10000),
   })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
@@ -580,12 +581,14 @@ export async function login(identifier, password) {
     // The server doesn't know this account — but one created here before the
     // server existed, or on a host that has none, is still valid in this browser.
     // A wrong password fails both ways, so this cannot sign anyone in falsely.
-    const local = await loginLocally(id, password, { allowDemoAdmin: !(await apiAvailable()) }).catch(() => null)
+    const local = await loginLocally(id, password, { allowDemoAdmin: await demoAdminAllowed() }).catch(() => null)
     if (local) return local
     throw new Error(live.data.error || 'Invalid email/username or password')
   }
 
-  return loginLocally(id, password)
+  // Same rule on the no-server path: the demo Admin only exists where the host
+  // confirmed it has no account service — not merely where one failed to answer.
+  return loginLocally(id, password, { allowDemoAdmin: await demoAdminAllowed() })
 }
 
 /** Sign in against the accounts stored in this browser (no server involved). */
@@ -915,7 +918,7 @@ export async function getMe() {
   // A session for the seeded Admin predates the account service, and on a
   // deployed host it would be a standing free pass to every paid feature. Drop it
   // rather than honour it — the demo account only exists where there is no server.
-  if (local?.isAdmin && await apiAvailable()) {
+  if (local?.isAdmin && !(await demoAdminAllowed())) {
     clearSession()
     return null
   }
@@ -958,13 +961,32 @@ function goToStripe(url) {
  * no API answers with HTML (or nothing at all).
  */
 let apiProbe = null
-export function apiAvailable() {
+
+/**
+ * What this origin is: 'api' when a JSON account service answers, 'no-api' when
+ * something answers but is not one (the dev server, a static host), and 'unknown'
+ * when the request itself failed. The three are kept apart on purpose.
+ *
+ * The demo Admin account is a development tool, so it may only be offered where
+ * a host has *confirmed* it has no account service. A flaky network is not a
+ * licence to hand out full access on the live site, so 'unknown' fails closed.
+ */
+export function apiProbeResult() {
   if (apiProbe === null) {
     apiProbe = fetch(`${API_URL}/me`, { headers: serverHeaders() })
-      .then((res) => (res.headers.get('content-type') || '').includes('application/json'))
-      .catch(() => false)
+      .then((res) => ((res.headers.get('content-type') || '').includes('application/json') ? 'api' : 'no-api'))
+      .catch(() => 'unknown')
   }
   return apiProbe
+}
+
+export function apiAvailable() {
+  return apiProbeResult().then((mode) => mode === 'api')
+}
+
+/** True only where the host has confirmed there is no account service at all. */
+export function demoAdminAllowed() {
+  return apiProbeResult().then((mode) => mode === 'no-api')
 }
 
 /** Unlock something in this browser alone — the demo path, when nothing can charge. */
@@ -1086,9 +1108,9 @@ export async function toggle2FA() {
 
 /** Plans held in this browser, scoped to a local account when one is signed in. */
 function localFloorplans() {
-  const user = sessionUser()
   const all = safeParse(ls().getItem(FLOORS_KEY), {})
-  return Object.values(all).filter((f) => !user || !f.owner || f.owner === user.id)
+  const owner = planOwner()
+  return Object.values(all).filter((f) => owner && f.owner === owner)
 }
 
 function writeLocalPlan(plan) {
@@ -1097,15 +1119,53 @@ function writeLocalPlan(plan) {
   ls().setItem(FLOORS_KEY, JSON.stringify(all))
 }
 
+// Server identity is decoded only to scope browser drafts, never to grant access.
+// The Worker verifies the signed token for every privileged request.
+export function planOwner() {
+  const token = serverToken()
+  if (token) {
+    try {
+      const value = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')
+      return JSON.parse(atob(value.padEnd(Math.ceil(value.length / 4) * 4, '='))).sub || null
+    } catch { return null }
+  }
+  return sessionUser()?.id || null
+}
+
+export function readLocalPlan(id) {
+  return localFloorplans().find((plan) => plan.id === id) || null
+}
+
+export function writePlanDraft(name, data, id = crypto.randomUUID()) {
+  const owner = planOwner()
+  if (!owner) throw new Error('Sign in to save a plan')
+  const plan = { id, owner, name: String(name || 'My floorplan').trim().slice(0, 120), data,
+    updated: Date.now(), pendingSync: !!serverToken() }
+  writeLocalPlan(plan)
+  return plan
+}
+
 export async function listFloorplans() {
+  const owner = planOwner()
   const local = localFloorplans()
   if (!serverToken()) return local.sort((a, b) => b.updated - a.updated)
   try {
     const remote = await api('/floorplans', null, 'GET')
+    if (planOwner() !== owner) return []
     const byId = new Map(local.map((f) => [f.id, f]))
-    for (const row of remote) byId.set(row.id, row)
+    for (const row of remote) {
+      const draft = byId.get(row.id)
+      if (!draft?.pendingSync) {
+        byId.set(row.id, row)
+        writeLocalPlan(row)
+      }
+    }
     return [...byId.values()].sort((a, b) => (b.updated || 0) - (a.updated || 0))
-  } catch { return local }
+  } catch (error) {
+    if (planOwner() !== owner) return []
+    if (/Unauthorised/i.test(error.message)) throw error
+    return local
+  }
 }
 
 /**
@@ -1122,29 +1182,72 @@ export async function aiSuggestSpots({ walls = [], cameras = [], objects = [] } 
   return api('/ai/suggest', { walls, cameras, objects })
 }
 
-export async function saveFloorplan(name, data, id = null) {
-  track('floorplan_saved', { id })
-  const user = sessionUser()
-  const plan = { id: id || 'fp_' + Date.now(), owner: user ? user.id : null, name, data, updated: Date.now() }
-  // The browser copy is written first: a plan is never lost to a failed request.
-  writeLocalPlan(plan)
-  if (serverToken()) {
-    try {
-      const row = await api('/floorplans', { id: plan.id, name, data })
-      writeLocalPlan({ ...plan, ...row })
-      return row
-    } catch { /* the local copy already holds it */ }
+export async function saveFloorplan(name, data, id = null, options = {}) {
+  const plan = writePlanDraft(name, data, id || crypto.randomUUID())
+  if (!serverToken()) return plan
+  const row = await api('/floorplans', { id: plan.id, name: plan.name, data }, 'POST', options)
+  // A completed request must not erase edits made while it was in flight.
+  const current = readLocalPlan(plan.id)
+  if (current && JSON.stringify(current.data) === JSON.stringify(data) && current.name === plan.name) {
+    writeLocalPlan({ ...row, pendingSync: false })
   }
-  return plan
+  return row
 }
 
 export async function deleteFloorplan(id) {
-  if (serverToken()) {
-    try { await api(`/floorplans/${id}`, null, 'DELETE') } catch { /* not on the server */ }
-  }
+  const owner = planOwner()
+  if (!readLocalPlan(id) && !serverToken()) throw new Error('Plan not found')
+  if (serverToken()) await api(`/floorplans/${encodeURIComponent(id)}`, null, 'DELETE')
+  if (owner !== planOwner()) return
   const all = safeParse(ls().getItem(FLOORS_KEY), {})
-  delete all[id]
+  if (all[id]?.owner === owner) delete all[id]
   ls().setItem(FLOORS_KEY, JSON.stringify(all))
+}
+
+// ─── Shared plan links ────────────────────────────────────────────────────────
+// Publish, read, revoke and review. Reads are public (a share link works signed
+// out), so they do not go through api() — which only speaks once there is a session.
+
+async function publicShare(path, options = {}) {
+  const res = await fetch(`${API_URL}${path}`, {
+    method: options.method || 'GET',
+    headers: options.body ? { 'Content-Type': 'application/json' } : undefined,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+    signal: AbortSignal.timeout(10000),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+  return data
+}
+
+export async function createShare(name, data) {
+  track('share_created', {})
+  return api('/shares', { name, data })
+}
+
+export async function listShares() {
+  try { return await api('/shares', null, 'GET') } catch (e) { if (e.message === 'demo') return []; throw e }
+}
+
+export async function revokeShare(code) {
+  return api(`/shares/${encodeURIComponent(code)}`, null, 'DELETE')
+}
+
+export function getSharedPlan(code) {
+  return publicShare(`/shares/${encodeURIComponent(code)}`)
+}
+
+export function addShareComment(code, comment) {
+  return api(`/shares/${encodeURIComponent(code)}/comments`, comment)
+}
+
+export function deleteShareComment(code, id) {
+  return api(`/shares/${encodeURIComponent(code)}/comments/${encodeURIComponent(id)}`, null, 'DELETE')
+}
+
+export function emailShare(code, email) {
+  track('share_emailed', {})
+  return api(`/shares/${encodeURIComponent(code)}/email`, { email })
 }
 
 // ─── Admin operations ────────────────────────────────────────────────────────

@@ -21,6 +21,8 @@ import {
   getUser, listUsers, saveUser, listFloorplans, saveFloorplan, deleteFloorplan, setFlag,
   stripeCheckoutSession, stripeGetSession, stripeListInvoices,
   stripePortalSession, verifyStripeSignature, stripeConfigured,
+  shareCode, saveShare, getShare, deleteShare, listShares,
+  listShareComments, saveShareComments, countShareOpen, sendReportEmail,
   generateVerificationCode, hashCode, verifyCode, credentialProblem, sendVerificationEmail, sendResetEmail,
   emailConfigured, resendCooldownRemaining, CODE_TTL_MS, CODE_MAX_ATTEMPTS,
   json, cors, rateLimit, readJson, writeJson,
@@ -440,9 +442,12 @@ async function handle(request, env) {
     const user = await authUser(request)
     if (!user) return json({ error: 'Unauthorised' }, 401)
     const { id, name, data } = await request.json()
-    if (user.plan === 'free' && !id) {
+    if (id != null && (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(id))) return json({ error: 'Invalid plan ID' }, 400)
+    if (typeof name !== 'string' || !name.trim() || name.length > 120 || !data || typeof data !== 'object' || Array.isArray(data)) return json({ error: 'Invalid plan document' }, 400)
+    if (JSON.stringify(data).length > 500000) return json({ error: 'Plan exceeds 500 KB' }, 413)
+    if (user.plan === 'free' && !user.is_admin) {
       const existing = await listFloorplans(user.id)
-      if (existing.length >= 1) return json({ error: 'Free tier limit: 1 floorplan' }, 402)
+      if (!existing.some((plan) => plan.id === id) && existing.length >= 1) return json({ error: 'Free tier limit: 1 floorplan' }, 402)
     }
     const row = {
       id: id || crypto.randomUUID(), owner: user.id, name, data,
@@ -591,6 +596,129 @@ async function handle(request, env) {
   // events here is what makes the numbers cover *every* visitor instead of the one
   // person looking at the panel. Only the allow-listed names are counted, and always
   // as a per-day total, so a caller cannot turn this into a write amplifier.
+  // ── Shared plan links (capability links + client review) ─────────────────
+  // A share is an immutable snapshot under a random code: possession of the link
+  // is the capability. Publishing, revoking and emailing are owner-only; viewing
+  // needs no account; a comment needs a signed-in reviewer *and* the link.
+  const shareMatch = path.match(/^\/shares\/([A-Za-z0-9_-]{1,100})(\/.*)?$/)
+  const shareEntitled = (u) => Boolean(u && (u.is_admin || String(u.plan || '').startsWith('premium')))
+  const publicComment = ({ author: _author, ...rest }) => rest
+
+  if (path === '/shares' && method === 'GET') {
+    const user = await authUser(request)
+    if (!user) return json({ error: 'Unauthorised' }, 401)
+    return json(await listShares(user.id))
+  }
+  if (path === '/shares' && method === 'POST') {
+    const user = await authUser(request)
+    if (!user) return json({ error: 'Unauthorised' }, 401)
+    if (!shareEntitled(user)) return json({ error: 'Shareable plan links come with Premium' }, 402)
+    const { name, data } = await request.json().catch(() => ({}))
+    if (typeof name !== 'string' || !name.trim() || name.length > 120) return json({ error: 'Invalid plan name' }, 400)
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return json({ error: 'Invalid plan document' }, 400)
+    if (JSON.stringify(data).length > 500000) return json({ error: 'Plan exceeds 500 KB' }, 413)
+    const code = shareCode()
+    const created = Date.now()
+    await saveShare({ code, owner: user.id, name: name.trim().slice(0, 120), data, created, expires: created + 30 * 86400000 })
+    return json({ code, name: name.trim().slice(0, 120), created, expires: created + 30 * 86400000 })
+  }
+
+  if (shareMatch) {
+    const code = shareMatch[1]
+    const rest = shareMatch[2] || ''
+    const record = await getShare(code)
+    const live = Boolean(record && record.expires > Date.now())
+
+    if (rest === '' && method === 'GET') {
+      if (!record) return json({ error: 'This link is not valid' }, 404)
+      if (!live) return json({ error: 'This link has expired' }, 410)
+      const opens = await countShareOpen(code).catch(() => 0)
+      const comments = await listShareComments(code)
+      // A signed-in viewer learns only whether they own it — never who does.
+      const viewer = await authUser(request).catch(() => null)
+      return json({
+        code, name: record.name, data: record.data, created: record.created,
+        expires: record.expires,
+        isOwner: Boolean(viewer && viewer.id === record.owner),
+        // Open counts are best effort — KV has no atomic counter.
+        opens: viewer && viewer.id === record.owner ? opens : undefined,
+        canComment: Boolean(viewer),
+        comments: comments.map((c) => ({
+          ...publicComment(c),
+          canDelete: Boolean(viewer && (c.author === viewer.id || viewer.id === record.owner)),
+        })),
+      })
+    }
+    if (rest === '' && method === 'DELETE') {
+      const user = await authUser(request)
+      if (!user) return json({ error: 'Unauthorised' }, 401)
+      if (!record) return json({ error: 'Not found' }, 404)
+      if (record.owner !== user.id) return json({ error: 'Not your share' }, 403)
+      await deleteShare(code)
+      return json({ ok: true })
+    }
+    if (rest === '/comments' && method === 'GET') {
+      if (!record) return json({ error: 'This link is not valid' }, 404)
+      const comments = await listShareComments(code)
+      return json(comments.map(publicComment))
+    }
+    if (rest === '/comments' && method === 'POST') {
+      const user = await authUser(request)
+      if (!user) return json({ error: 'Sign in to leave a review note' }, 401)
+      if (!live) return json({ error: 'This link is not valid' }, 404)
+      if (!rateLimit(`comment:${user.id}`, 10)) return json({ error: 'Too many comments — try again in a minute' }, 429)
+      const body = await request.json().catch(() => ({}))
+      const text = String(body.text || '').trim()
+      const floorIndex = body.floorIndex
+      const x = body.x, y = body.y
+      if (!text || text.length > 2000) return json({ error: 'A comment must be 1–2,000 characters' }, 400)
+      if (typeof floorIndex !== 'number' || !Number.isInteger(floorIndex) || floorIndex < 0 || floorIndex > 100) return json({ error: 'Invalid floor' }, 400)
+      if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y) || Math.abs(x) > 1e6 || Math.abs(y) > 1e6) return json({ error: 'Invalid position' }, 400)
+      const comments = await listShareComments(code)
+      const comment = {
+        id: crypto.randomUUID(), author: user.id,
+        authorName: String(user.name || 'Reviewer').slice(0, 80),
+        floorIndex, x, y, text, created: Date.now(),
+      }
+      await saveShareComments(code, [...comments, comment].slice(-500))
+      return json(publicComment(comment))
+    }
+    const commentDelete = rest.match(/^\/comments\/([A-Za-z0-9_-]{1,64})$/)
+    if (commentDelete && method === 'DELETE') {
+      const user = await authUser(request)
+      if (!user) return json({ error: 'Unauthorised' }, 401)
+      const comments = await listShareComments(code)
+      const target = comments.find((c) => c.id === commentDelete[1])
+      if (!target) return json({ error: 'Not found' }, 404)
+      if (target.author !== user.id && (!record || record.owner !== user.id)) return json({ error: 'Not your comment' }, 403)
+      await saveShareComments(code, comments.filter((c) => c.id !== commentDelete[1]))
+      return json({ ok: true })
+    }
+    if (rest === '/email' && method === 'POST') {
+      const user = await authUser(request)
+      if (!user) return json({ error: 'Unauthorised' }, 401)
+      if (!record || record.owner !== user.id) return json({ error: 'Not your share' }, 403)
+      if (!live) return json({ error: 'This link has expired' }, 410)
+      if (!rateLimit(`share-mail:${user.id}`, 5)) return json({ error: 'Too many emails — try again in a minute' }, 429)
+      const body = await request.json().catch(() => ({}))
+      const recipient = String(body.email || '').trim().toLowerCase()
+      if (!/^\S+@\S+\.\S+$/.test(recipient) || recipient.length > 200) return json({ error: 'Enter a valid recipient address' }, 400)
+      const appUrl = String(globalThis.env.APP_URL || new URL(request.url).origin).replace(/\/+$/, '')
+      const url = `${appUrl}/?share=${code}`
+      const comments = await listShareComments(code)
+      try {
+        await sendReportEmail(recipient, {
+          title: record.name,
+          summary: `A security plan was shared for review${comments.length ? ` with ${comments.length} note(s)` : ''}.`,
+          url,
+        })
+      } catch (error) {
+        return json({ error: error.message }, 502)
+      }
+      return json({ ok: true })
+    }
+  }
+
   if (path === '/analytics' && method === 'POST') {
     const { event } = await request.json().catch(() => ({}))
     if (typeof event !== 'string' || !event) return json({ error: 'An event name is required' }, 400)

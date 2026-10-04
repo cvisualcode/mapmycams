@@ -33,6 +33,7 @@ export function serializePlan(plan = {}) {
   const floors = Array.isArray(plan.floors) ? plan.floors : []
   return JSON.stringify({
     v: 1,
+    calibration: plan.calibration || null,
     activeFloor: Number.isFinite(plan.activeFloor) ? plan.activeFloor : 0,
     floors: floors.map((floor) => ({
       walls: floor?.walls || [],
@@ -53,6 +54,7 @@ export function deserializePlan(serialized) {
   }
   const floors = Array.isArray(parsed?.floors) ? parsed.floors : []
   return {
+    calibration: parsed?.calibration || null,
     activeFloor: Number.isFinite(parsed?.activeFloor) ? parsed.activeFloor : 0,
     floors: floors.map((floor) => ({
       walls: Array.isArray(floor?.walls) ? floor.walls : [],
@@ -90,6 +92,7 @@ export function normalizePlanData(data, floorCount = 1) {
   while (floors.length < want) floors.push(asFloor(null))
   const active = Number(data?.activeFloor)
   return {
+    calibration: data?.calibration || null,
     activeFloor: Number.isInteger(active) && active >= 0 && active < floors.length ? active : 0,
     floors,
   }
@@ -103,11 +106,12 @@ export function normalizePlanData(data, floorCount = 1) {
  * round trip through JSON is tested as one thing rather than two halves that each look
  * right on their own.
  */
-export function planDocument({ floors = [], activeFloor = 0 } = {}) {
+export function planDocument({ floors = [], activeFloor = 0, calibration = null } = {}) {
   const list = (value) => (Array.isArray(value) ? value : [])
   const active = Number(activeFloor)
   return {
-    version: 2,
+    version: 3,
+    calibration,
     activeFloor: Number.isInteger(active) && active >= 0 ? active : 0,
     floors: (Array.isArray(floors) ? floors : []).map((floor) => ({
       walls: list(floor?.walls),

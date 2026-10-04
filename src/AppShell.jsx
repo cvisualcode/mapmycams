@@ -4,6 +4,8 @@
 // The editor itself lives in src/App.jsx and is mounted as <EditorApp />.
 
 import { useEffect, useRef, useState } from 'react'
+import * as api from './monetisation/api'
+import { createAutosave } from './editor/autosave'
 import { EntitlementsProvider, useEntitlements } from './monetisation/EntitlementsContext'
 import { LoginScreen, VerifyEmailScreen, Dashboard, PricingPage, AdminPanel, UpgradeModal, CheckoutGate } from './monetisation/MonetisationUI'
 import LandingPage from './monetisation/LandingPage'
@@ -13,6 +15,7 @@ import { planHasContent } from './editor/history'
 import { readSharedPlan } from './monetisation/share'
 import EditorApp from './App.jsx'
 import EditorMobileMenu from './editor/mobile-menu.jsx'
+import ShareViewer from './monetisation/ShareViewer.jsx'
 
 function MonetisedApp() {
   const ent = useEntitlements()
@@ -26,6 +29,11 @@ function MonetisedApp() {
   const [showHome, setShowHome] = useState(false)
   // A plan opened from a shared #plan=… link, edited as a copy of itself.
   const [sharedPlan, setSharedPlan] = useState(null)
+  // A plan opened from a short share link (?share=<code>) is shown read-only,
+  // before any sign-in gate — a client with the link must be able to view it.
+  const [shareCode, setShareCode] = useState(() => (
+    typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('share')
+  ))
 
   // Shared links are read once, on the way in. The fragment is cleared straight
   // away so a reload does not silently re-import it over the plan being worked on.
@@ -48,22 +56,78 @@ function MonetisedApp() {
   // Registered here rather than beside the editor's own handlers because this component
   // returns from several places further down, and a hook below those returns is a hook
   // that is called on some renders and not others.
-  const saveOnLeaveRef = useRef(() => {})
+  const saverRef = useRef(null)
+  const sessionRef = useRef(null)
+  const [saveStatus, setSaveStatus] = useState('')
+  const [exiting, setExiting] = useState(false)
+  const owner = ent.user?.id
   useEffect(() => {
-    saveOnLeaveRef.current = () => {
+    if (view !== 'editor' || !owner) return undefined
+    const session = sessionRef.current
+    if (!session) return undefined
+    const saver = createAutosave({
+      writeDraft: (data) => {
+        if (api.planOwner() !== owner) throw new Error('Your account changed; reopen the plan')
+        api.writePlanDraft(session.name, data, session.id)
+      },
+      save: async (data, options) => {
+        if (api.planOwner() !== owner) throw new Error('Your account changed; reopen the plan')
+        await api.saveFloorplan(session.name, data, session.id, options)
+      },
+      onStatus: setSaveStatus,
+    })
+    saverRef.current = saver
+    const capture = () => {
       const snapshot = buildFloorplanSnapshot()
-      if (!planHasContent(snapshot)) return
-      ent.saveFloorplan(loadedPlan ? loadedPlan.name : 'My floorplan', snapshot, loadedPlan ? loadedPlan.id : null).catch(() => {})
+      if (snapshot && (planHasContent(snapshot) || session.existing)) {
+        saver.capture(snapshot)
+        session.existing = true
+      }
     }
-  })
-  useEffect(() => {
-    if (view !== 'editor') return undefined
-    const leave = () => saveOnLeaveRef.current()
+    const leave = () => {
+      try { capture() } catch (error) { setSaveStatus(`Not saved: ${error.message}`); return }
+      saver.flush({ keepalive: true }).catch((error) => setSaveStatus(`Saved in this browser only: ${error.message}`))
+    }
+    const hidden = () => { if (document.visibilityState === 'hidden') leave() }
+    const changed = () => { try { capture() } catch (error) { setSaveStatus(`Not saved: ${error.message}`) } }
+    const online = () => leave()
+    window.addEventListener('mmc:plan-changed', changed)
     window.addEventListener('pagehide', leave)
-    return () => window.removeEventListener('pagehide', leave)
-  }, [view])
+    window.addEventListener('online', online)
+    document.addEventListener('visibilitychange', hidden)
+    changed()
+    return () => {
+      window.removeEventListener('mmc:plan-changed', changed)
+      window.removeEventListener('pagehide', leave)
+      window.removeEventListener('online', online)
+      document.removeEventListener('visibilitychange', hidden)
+      saver.dispose()
+      if (saverRef.current === saver) saverRef.current = null
+    }
+  }, [view, owner])
 
   if (ent.loading) return <div className="auth-screen"><p>Loading…</p></div>
+
+  // The share viewer wins over everything except the sign-in screen it sends you
+  // to when you want to comment — and comes back once the account is in.
+  if (shareCode && !(authTab && !ent.user)) {
+    return (
+      <ShareViewer
+        code={shareCode}
+        signedIn={!!ent.user}
+        onSignIn={() => setAuthTab('login')}
+        onMakeCopy={(report) => {
+          window.history.replaceState({}, '', window.location.pathname)
+          setShareCode(null)
+          sessionRef.current = { id: crypto.randomUUID(), name: `${String(report.name || 'Shared plan').slice(0, 100)} (copy)`, existing: false }
+          setSharedPlan(report.data)
+          setLoadedPlan(null)
+          setSaveStatus('')
+          setView('editor')
+        }}
+      />
+    )
+  }
 
   // One decision, one place: verify the emailed code, sign in, or read the home
   // page. See monetisation/routing.js.
@@ -89,7 +153,11 @@ function MonetisedApp() {
 
   function openPlan(fp) {
     setSharedPlan(null)
-    setLoadedPlan(fp)
+    const draft = api.readLocalPlan(fp.id)
+    const chosen = draft?.pendingSync ? draft : fp
+    sessionRef.current = { id: chosen.id, name: chosen.name || 'My floorplan', existing: true }
+    setLoadedPlan(chosen)
+    setSaveStatus('')
     setView('editor')
   }
 
@@ -98,28 +166,33 @@ function MonetisedApp() {
       ent.promptUpgrade('Save more floorplans', 'Free tier stores 1 floorplan. Upgrade to Premium for unlimited layouts.', 'premium_monthly')
       return
     }
+    sessionRef.current = { id: crypto.randomUUID(), name: 'My floorplan', existing: false }
     setLoadedPlan(null)
     setSharedPlan(null)
+    setSaveStatus('')
     setView('editor')
   }
 
   /** Back into the app from the home page, straight into the planner. */
   function openPlanner() {
     setShowHome(false)
-    setLoadedPlan(null)
-    setView('editor')
+    if (ent.floorplans.length) openPlan(ent.floorplans[0])
+    else newPlan()
   }
 
-  function exitEditor() {
-    const snapshot = buildFloorplanSnapshot()
-    // An empty editor is not a plan: saving one leaves a row on the dashboard that opens
-    // to nothing, and on the Free tier it uses up the one plan the account has. A plan
-    // that already exists is saved whatever it holds now, so emptying one sticks.
-    if (snapshot && (planHasContent(snapshot) || loadedPlan)) {
-      ent.saveFloorplan(loadedPlan ? loadedPlan.name : 'My floorplan', snapshot, loadedPlan ? loadedPlan.id : null).catch(() => {})
-    }
-    setSharedPlan(null)
-    setView('dashboard')
+  async function exitEditor() {
+    if (exiting) return
+    setExiting(true)
+    try {
+      const snapshot = buildFloorplanSnapshot()
+      if (snapshot && (planHasContent(snapshot) || sessionRef.current?.existing)) saverRef.current?.capture(snapshot)
+      await saverRef.current?.flush()
+      await ent.refreshFloorplans()
+      setSharedPlan(null)
+      setView('dashboard')
+    } catch (error) {
+      setSaveStatus(`Could not sync: ${error.message}. Your browser draft is kept. Retry Save or stay here.`)
+    } finally { setExiting(false) }
   }
 
   // Both prompts have to be reachable from every view that can start a purchase:
@@ -137,6 +210,7 @@ function MonetisedApp() {
       <>
         {/* The editor's toolbar collapses into a menu on a phone. See
             src/editor/mobile-menu.jsx for why this lives beside the editor. */}
+        <div className="save-status" role="status">{saveStatus || 'Autosave ready'} <button disabled={exiting} onClick={exitEditor}>{exiting ? 'Saving…' : 'Save & Dashboard'}</button></div>
         <EditorMobileMenu>
           <EditorApp
           // Remounting is what gives the editor new starting state, since the

@@ -142,7 +142,7 @@ console.log('\nA plan from anywhere')
   const readBack = normalizePlanData(JSON.parse(JSON.stringify(written)), 4)
   check('a saved plan comes back out of JSON with its ground floor intact', readBack.floors[0].walls.length === 1 && readBack.floors[0].cameras.length === 1)
   check('\u2026and the floor that was on screen still on screen', readBack.activeFloor === 1 && readBack.floors[1].objects.length === 1)
-  check('a saved plan says which version it is', written.version === 2 && Array.isArray(written.floors))
+  check('a saved plan says which version it is', written.version === 3 && Array.isArray(written.floors))
 
   check('an active floor that is not in the plan falls back to the ground', normalizePlanData({ activeFloor: 7, floors: [{}] }, 4).activeFloor === 0)
   check('a floor number that is not a number falls back too', normalizePlanData({ activeFloor: 'first', floors: [{}] }, 4).activeFloor === 0)

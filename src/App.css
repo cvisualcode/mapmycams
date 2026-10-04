@@ -1,3 +1,6 @@
+.save-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 12px; font-size: 12px; background: #101a29; color: #d7e5f5; }
+.save-status button { flex-shrink: 0; }
+.fp-row { flex-wrap: wrap; }
 .app {
   display: flex;
   flex-direction: column;
