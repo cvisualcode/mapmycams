@@ -8,7 +8,7 @@
 //   AUTH_SECRET       (secret)  — signs session tokens and keys password hashes
 //   MAPMYCAMS_STORE   (binding) — the KV namespace holding accounts, plans, flags
 
-import { verificationEmail, passwordResetEmail } from './email-template.js'
+import { verificationEmail, passwordResetEmail, escapeHtml } from './email-template.js'
 
 const AUTH_SECRET = () => globalThis.env?.AUTH_SECRET
 const store = () => globalThis.env?.MAPMYCAMS_STORE
@@ -75,12 +75,17 @@ export async function signToken(user, days = 30) {
 export async function verifyToken(token) {
   try {
     requireConfig()
-    const [h, p, sig] = token.split('.')
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    const [h, p, sig] = parts
+    const header = JSON.parse(b64url(h, true))
+    if (header.alg !== 'HS256' || header.typ !== 'JWT') return null
     const key = await hmacKey(AUTH_SECRET())
     const ok = await crypto.subtle.verify('HMAC', key, b64urlBytes(sig), new TextEncoder().encode(`${h}.${p}`))
     if (!ok) return null
     const payload = JSON.parse(b64url(p, true))
-    if (payload.exp * 1000 < Date.now()) return null
+    if (!Number.isFinite(payload.exp) || payload.exp * 1000 <= Date.now()) return null
+    if (payload.pv != null && (!Number.isInteger(payload.pv) || payload.pv < 0)) return null
     return payload.sub && payload.email
       ? { id: payload.sub, email: payload.email, pv: payload.pv || 0 }
       : null
@@ -210,13 +215,24 @@ const userKey = (email) => `user:${String(email || '').trim().toLowerCase()}`
 
 export async function getUser(email) {
   requireConfig()
-  return (await store().get(userKey(email), 'json')) || null
+  const row = (await store().get(userKey(email), 'json')) || null
+  if (!row) return null
+  // Separate, append-only grant keys cannot be overwritten by a password/profile
+  // update or another simultaneous purchase. Legacy account add-ons are retained.
+  const addons = ['ai_pack', 'pdf_report', 'brands']
+  const grants = await Promise.all(addons.map((item) => store().get(`owned:${row.id}:${item}`, 'json')))
+  return { ...row, addons: [...new Set([...(row.addons || []), ...addons.filter((_, i) => grants[i])])] }
 }
 
 export async function listUsers(limit = 1000) {
   requireConfig()
-  const { keys } = await store().list({ prefix: 'user:', limit })
-  const rows = await Promise.all(keys.map((k) => store().get(k.name, 'json')))
+  const rows = []
+  let cursor
+  do {
+    const page = await store().list({ prefix: 'user:', limit, ...(cursor ? { cursor } : {}) })
+    rows.push(...await Promise.all(page.keys.map((k) => store().get(k.name, 'json'))))
+    cursor = page.list_complete === false ? page.cursor : null
+  } while (cursor)
   return rows.filter(Boolean)
 }
 
@@ -333,8 +349,8 @@ export async function sendReportEmail(email, { title, summary, url }) {
     subject: `Security plan report: ${String(title).slice(0, 80)}`,
     html: [
       '<h2 style="font-family:sans-serif">Your security plan report is ready</h2>',
-      `<p style="font-family:sans-serif">${String(summary).slice(0, 600)}</p>`,
-      `<p style="font-family:sans-serif"><a href="${url}">Open the printable report</a></p>`,
+      `<p style="font-family:sans-serif">${escapeHtml(String(summary).slice(0, 600))}</p>`,
+      `<p style="font-family:sans-serif"><a href="${escapeHtml(url)}">Open the printable report</a></p>`,
       '<p style="font-family:sans-serif;color:#64748b">The report opens read-only. Use your browser\'s print dialog to save it as a PDF.</p>',
     ].join(''),
     text: `Security plan report: ${url}`,
@@ -394,13 +410,14 @@ async function stripeFetch(path, params, method = 'POST') {
  * nothing is granted until a payment completes, which is reported either by the
  * webhook or by the account app asking Stripe about the session on return.
  */
-export async function stripeCheckoutSession({ priceId, userId, email, mode, item }) {
+export async function stripeCheckoutSession({ priceId, userId, email, mode, item, customerId }) {
   const params = {
     mode, // 'subscription' | 'payment'
     'line_items[0][price]': priceId,
     'line_items[0][quantity]': '1',
     client_reference_id: userId,
-    customer_email: email,
+    ...(customerId ? { customer: customerId } : { customer_email: email }),
+    ...(mode === 'payment' && !customerId ? { customer_creation: 'always' } : {}),
     // Stripe fills {CHECKOUT_SESSION_ID} in, so the app can confirm the purchase
     // itself instead of waiting for the webhook to land.
     success_url: `${APP_URL()}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
@@ -436,23 +453,56 @@ export async function stripePortalSession(customerId) {
 
 /** Verify Stripe webhook signature (t=,v1= scheme). */
 export async function verifyStripeSignature(payload, sigHeader, secret) {
-  const parts = Object.fromEntries(sigHeader.split(',').map((kv) => kv.split('=')))
+  if (!secret || typeof sigHeader !== 'string') return false
+  const parts = sigHeader.split(',').map((part) => part.trim().split('='))
+  const timestamps = parts.filter(([name]) => name === 't')
+  if (timestamps.length !== 1 || !/^\d+$/.test(timestamps[0][1])) return false
+  const timestamp = Number(timestamps[0][1])
+  if (!Number.isSafeInteger(timestamp) || Math.abs(Date.now() / 1000 - timestamp) > 300) return false
   const key = await hmacKey(secret)
-  const expected = b64url(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${parts.t}.${payload}`)))
-  return expected === parts.v1
+  const digest = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${timestamp}.${payload}`))
+  const expected = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+  return parts.some(([name, value]) => name === 'v1' && /^[a-f0-9]{64}$/.test(value || '') && timingSafeEqual(expected, value))
+}
+
+/** Permanent receipt and one-time ownership. No TTL, browser state, or user-row rewrite. */
+export async function recordPurchase(account, session) {
+  const key = `purchase:${account.id}:${session.id}`
+  const existing = await readJson(key)
+  const receipt = existing || {
+    id: session.id, owner: account.id, item: session.metadata.item,
+    kind: session.mode === 'payment' ? 'addon' : 'subscription',
+    amount: (session.amount_total || 0) / 100, currency: session.currency || 'gbp',
+    customer: session.customer, subscription: session.subscription || null,
+    status: 'paid', date: new Date((session.created || Math.floor(Date.now() / 1000)) * 1000).toISOString(),
+  }
+  if (!existing) await writeJson(key, receipt)
+  if (session.mode === 'payment') await writeJson(`owned:${account.id}:${session.metadata.item}`, { purchase: session.id })
+  return receipt
+}
+
+export async function listPurchases(ownerId) {
+  const rows = []
+  let cursor
+  do {
+    const page = await store().list({ prefix: `purchase:${ownerId}:`, limit: 1000, ...(cursor ? { cursor } : {}) })
+    rows.push(...await Promise.all(page.keys.map((key) => readJson(key.name))))
+    cursor = page.list_complete === false ? page.cursor : null
+  } while (cursor)
+  return rows.filter(Boolean).sort((a, b) => b.date.localeCompare(a.date))
 }
 
 /** CORS headers for all responses. */
 export function cors() {
   return {
-    'Access-Control-Allow-Origin': globalThis.env?.ALLOWED_ORIGIN || '*',
+    'Access-Control-Allow-Origin': globalThis.env?.ALLOWED_ORIGIN || globalThis.env?.APP_URL || 'https://mapmycams.dev',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
   }
 }
 
 export function json(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...cors() } })
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...cors() } })
 }
 
 /** Naive per-user rate limiting for AI endpoints (in-memory; use KV at scale). */

@@ -2,6 +2,27 @@
 
 Full monetisation stack for the security-camera floorplan planner: accounts, free/premium tiers, Stripe billing, add-ons, AI suggestions, analytics and an admin panel.
 
+## Security audit and purchase retention
+
+Security repairs are covered by `bun run security:test` (real Worker and browser API modules, isolated KV, mocked Stripe/Resend) and `bun run browser:security <managed-preview-url>` (real Chromium login, reload, logout/sign-in, fresh browser context).
+
+- **No server demo grants:** missing Stripe keys/prices return 503, never Premium or an add-on. Production browser builds never fall back to local accounts or demo admin when the API is down or returns HTML.
+- **No verification/reset code disclosure:** missing/broken email delivery never exposes the code. Reset responses do not reveal provider outcomes or whether an account exists. `/auth/send-code` is retired (410) on both Worker and Pages: an Origin header is not authentication for an arbitrary-recipient email relay.
+- **Stripe authenticity:** raw-body HMAC-SHA256 is compared in Stripe's hex format, accepting rotating `v1` signatures and rejecting timestamps outside ±5 minutes. Only complete, paid sessions with matching account references, valid catalogue items and matching modes grant purchases. Delayed payments use `checkout.session.async_payment_succeeded`.
+- **Permanent account ownership:** `purchase:<accountId>:<checkoutSessionId>` stores the receipt without a TTL; `owned:<accountId>:<addon>` independently retains one-time ownership. Concurrent purchases and password/profile updates cannot overwrite these grants. `/me` restores them on any device; billing history includes one-time receipts and paginates KV results. Existing account `addons` are retained, but historical Stripe receipts are not backfilled automatically.
+- **Subscriptions are not lifetime access:** receipts remain permanently linked, but cancellation ends subscription access, never add-on ownership. Ended-subscription markers block replay of old success URLs; cancellation of a different subscription cannot revoke the current one.
+- **Additional repairs:** JWT expiry/header validation, rejection of unverified sessions, server login throttling, no-store API responses, exact-origin CORS, HTML escaping in emails, expiry protection for share comments, and removal of the nonfunctional 2FA toggle. Two-factor sign-in is not implemented.
+
+### Production checklist and honest limits
+
+Merge and deploy the Worker before these protections apply to `mapmycams.dev`; Pages deployment alone does not update that Worker. Register `checkout.session.async_payment_succeeded` on the existing Stripe webhook (the setup script now includes it, but was not run during this audit). Keep `RESEND_API_KEY`, `EMAIL_FROM`, Stripe secrets and price bindings configured on the Worker. `/shares` and `/shares/*` are now routed through the Worker rather than the SPA fallback.
+
+No live purchase, real email, production KV modification or deployment was performed by these tests. Fixtures cannot prove deployed bindings, actual delivery or payment settlement. This is a targeted application audit, not a full external penetration test or security certification.
+
+**“Forever” means no automatic expiry while the same account and storage exist.** Clearing browser storage, logging out, changing devices and resetting passwords do not delete server purchases. Storage deletion, account deletion/recreation, refunds, chargebacks, lost access to the email address and disaster recovery need deliberate policies. Existing purchases predating these repairs retain their account add-ons; this does not reconstruct previously lost data. Back up KV and reconcile historical purchases against Stripe before claiming disaster-proof retention. KV is eventually consistent; grant/receipt writes are independent and idempotent but not a cross-key transaction. Subscription/account write races still require a transactional store or Durable Object for strict global ordering. Rate limits are currently per-isolate best-effort; use Cloudflare edge rate limiting for distributed abuse resistance. Sessions remain bearer tokens in browser storage (logout drops the browser copy, password reset revokes older tokens); HttpOnly cookies and server-side session revocation are future hardening work.
+
+The sections below describe the earlier setup; the security rules above supersede its historical demo/email fallback behavior.
+
 ## Architecture
 
 ```
@@ -38,6 +59,9 @@ single read and there is no database to provision or migrate.
 | `user:<email>` | the account: id, name, `password_hash`, plan, add-ons, admin flag, pending verification code hash |
 | `plan:<ownerId>:<planId>` | one floorplan |
 | `flag:<name>` | a feature flag |
+| `purchase:<accountId>:<checkoutSessionId>` | permanent Stripe purchase receipt, no TTL |
+| `owned:<accountId>:<addon>` | permanent one-time add-on ownership, no TTL |
+| `subscription-ended:<subscriptionId>` | prevents restoring cancelled subscription access |
 
 `api/_lib.js` is the only module that touches the store and `api/index.js` the
 only caller, so that layout is the entire contract — swapping the storage means
@@ -585,6 +609,6 @@ bun run visibility:test   # 30 checks: counting, ceiling, error grouping, thrott
 - Passwords are hashed with WebCrypto when available and with a bundled
   SHA-256/HMAC/PBKDF2 implementation when it is not (a sandboxed or insecure
   context has no `crypto.subtle`). Both produce byte-identical hashes.
-- 2FA toggle in the dashboard (wire to an email-OTP provider in production).
+- Two-factor sign-in is not implemented; the misleading demo toggle has been removed.
 - Data deletion: deleting a floorplan removes it permanently; account deletion cascades all rows.
 - Analytics contain no plan geometry — only event names and metadata.

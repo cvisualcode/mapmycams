@@ -9,6 +9,7 @@
 // No part of this touches Google, Cloudflare's models or a deployed Worker.
 
 import { handle } from '../api/index.js'
+import { saveUser } from '../api/_lib.js'
 import { planRooms, planBounds, validateSpots, parseJsonObject, pickGeminiModel, workersAiText, suggestSpotsWithModel } from '../api/ai.js'
 
 // ── KV, in memory: accounts are really written and read ──────────────────────
@@ -38,15 +39,20 @@ const aiBinding = { run: (model, input) => { aiCalls.push({ model, input }); ret
 let geminiReply = { status: 200, body: { candidates: [{ content: { parts: [{ text: '{}' }] } }] } }
 let geminiModels = { status: 200, body: { models: [{ name: 'models/gemini-3.8-flash', supportedGenerationMethods: ['generateContent'] }] } }
 const geminiCalls = []
+const outbox = []
 globalThis.fetch = async (url, init = {}) => {
   const full = String(url)
+  if (full === 'https://api.resend.com/emails') {
+    outbox.push(JSON.parse(init.body).text.match(/\b\d{6}\b/)[0])
+    return Response.json({ id: 'email_test' })
+  }
   if (!full.startsWith('https://generativelanguage.googleapis.com/')) throw new Error(`unexpected network call to ${full}`)
   geminiCalls.push({ url: full, body: init.body ? JSON.parse(init.body) : null, key: init.headers?.['x-goog-api-key'] })
   const answer = full.includes('/models?') ? geminiModels : geminiReply
   return new Response(JSON.stringify(answer.body), { status: answer.status, headers: { 'Content-Type': 'application/json' } })
 }
 
-const env = { AUTH_SECRET: 'smoke-test-secret-0123456789-abcdefghijkl', MAPMYCAMS_STORE: memoryKV(), APP_URL: 'https://mapmycams.dev' }
+const env = { AUTH_SECRET: 'smoke-test-secret-0123456789-abcdefghijkl', MAPMYCAMS_STORE: memoryKV(), APP_URL: 'https://mapmycams.dev', RESEND_API_KEY: 're_test', EMAIL_FROM: 'test@mapmycams.dev' }
 
 let failures = 0
 function check(label, ok, detail = '') {
@@ -68,8 +74,8 @@ async function call(path, { method = 'POST', body, token } = {}) {
 
 const credential = (seed) => `pbkdf2$sha256$210000$${btoa(`salt-${seed}`)}$${btoa(`hash-${seed}-hash-${seed}`)}`
 async function createAccount(email) {
-  const signup = await call('/auth/signup', { body: { email, credential: credential(email), name: email.split('@')[0] } })
-  const verify = await call('/auth/verify', { body: { email, code: signup.data?.devCode } })
+  await call('/auth/signup', { body: { email, credential: credential(email), name: email.split('@')[0] } })
+  const verify = await call('/auth/verify', { body: { email, code: outbox.at(-1) } })
   return { token: verify.data?.token, id: verify.data?.user?.id, email }
 }
 
@@ -99,7 +105,7 @@ check('a Free account cannot reach the AI', denied.status === 402, JSON.stringif
 check('the refusal came before any model call', aiCalls.length === 0 && geminiCalls.length === 0)
 
 const alice = await createAccount('alice@example.com')
-await call('/billing/checkout', { token: alice.token, body: { item: 'ai_pack', kind: 'addon' } }) // demo grant
+await saveUser({ email: alice.email, addons: ['ai_pack'] }) // paid entitlement fixture; missing Stripe no longer grants
 
 // ── 2 · Workers AI — the default, and the one with no key to lose ────────────
 console.log('\nWorkers AI (the AI binding, no key)')
@@ -181,7 +187,7 @@ check('the keyless provider is preferred by default', defaultOrder.data?.provide
 // The per-account limit is 10 a minute, and every account above has spent its
 // budget, so the later sections each get a fresh one.
 const carol = await createAccount('carol@example.com')
-await call('/billing/checkout', { token: carol.token, body: { item: 'ai_pack', kind: 'addon' } })
+await saveUser({ email: carol.email, addons: ['ai_pack'] })
 
 // ── 4 · What the model is never allowed to do ────────────────────────────────
 console.log('\nValidation of what comes back')
@@ -212,7 +218,7 @@ console.log('\nRate limit')
 env.AI = aiBinding
 aiRun = async () => asChoice({ spots: [goodSpot()], summary: 'rate limit probe' })
 const dave = await createAccount('dave@example.com')
-await call('/billing/checkout', { token: dave.token, body: { item: 'ai_pack', kind: 'addon' } })
+await saveUser({ email: dave.email, addons: ['ai_pack'] })
 const statuses = []
 for (let i = 0; i < 11; i++) statuses.push((await call('/ai/suggest', { token: dave.token, body: PLAN })).status)
 check('the first ten calls are served', statuses.slice(0, 10).every((s) => s === 200), JSON.stringify(statuses))

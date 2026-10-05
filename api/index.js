@@ -25,7 +25,7 @@ import {
   listShareComments, saveShareComments, countShareOpen, sendReportEmail,
   generateVerificationCode, hashCode, verifyCode, credentialProblem, sendVerificationEmail, sendResetEmail,
   emailConfigured, resendCooldownRemaining, CODE_TTL_MS, CODE_MAX_ATTEMPTS,
-  json, cors, rateLimit, readJson, writeJson,
+  json, cors, rateLimit, readJson, writeJson, recordPurchase, listPurchases,
 } from './_lib.js'
 import { suggestSpotsWithModel, PIXELS_PER_METER } from './ai.js'
 
@@ -41,11 +41,6 @@ const PRICE_MAP = () => ({
 })
 
 /** The one-off add-ons, used when there are no Stripe prices to read a mode from. */
-const ADDON_ITEMS = ['ai_pack', 'pdf_report', 'brands']
-
-/** True for a plan key, false for an add-on key. */
-const isAddon = (item) => ADDON_ITEMS.includes(item)
-
 /**
  * Apply a completed purchase to an account.
  *
@@ -54,15 +49,22 @@ const isAddon = (item) => ADDON_ITEMS.includes(item)
  * first — and applying it twice (both do, normally) is harmless: the plan is
  * overwritten with the same value and add-ons are a set.
  */
-async function grantPurchase(account, { item, mode, customerId }) {
-  if (!account || !item) return null
-  const customer = customerId || account.stripe_customer_id
-  if (mode === 'subscription') {
-    if (isAddon(item)) return null
-    return saveUser({ email: account.email, plan: item, stripe_customer_id: customer })
+async function grantPurchase(account, session) {
+  const item = session.metadata?.item
+  const entry = PRICE_MAP()[item]
+  if (!account || !entry || entry.mode !== session.mode ||
+      session.client_reference_id !== account.id || session.metadata?.userId !== account.id ||
+      session.payment_status !== 'paid' || session.status !== 'complete' ||
+      !/^cs_[A-Za-z0-9_]+$/.test(session.id || '') || typeof session.customer !== 'string') return null
+  if (session.mode === 'subscription' && (typeof session.subscription !== 'string' || !session.subscription)) return null
+  await recordPurchase(account, session)
+  if (session.mode === 'subscription') {
+    // A retry/old success URL must not resurrect a cancelled subscription.
+    if (await readJson(`subscription-ended:${session.subscription}`)) return getUser(account.email)
+    return saveUser({ email: account.email, plan: item, stripe_customer_id: session.customer, stripe_subscription_id: session.subscription })
   }
-  if (!isAddon(item)) return null
-  return saveUser({ email: account.email, addons: [...new Set([...(account.addons || []), item])], stripe_customer_id: customer })
+  // Ownership is read from independent grant keys, not a mutable account array.
+  return saveUser({ email: account.email, stripe_customer_id: session.customer })
 }
 
 /** The only origins allowed to reach the verification mailer. */
@@ -182,7 +184,7 @@ async function authUser(request) {
   if (!claims) return null
   const user = await getUser(claims.email)
   if (!user || user.id !== claims.id) return null
-  return (user.password_version || 0) === (claims.pv || 0) ? user : null
+  return user.email_verified !== false && (user.password_version || 0) === (claims.pv || 0) ? user : null
 }
 
 /** Look an account up by id as well as email — admin and webhook callers use ids. */
@@ -208,27 +210,29 @@ function publicRow(u) {
 }
 
 /**
- * Send a code. Returns `devCode` only when no provider is configured, so the
- * flow is completable before RESEND_API_KEY is set — never in production.
+ * Send a server-generated code. Delivery failures never disclose the code;
+ * showing it would let an attacker verify an address they do not own.
  */
 async function deliverCode(email, code) {
-  if (!emailConfigured()) return { sent: false, devCode: code }
+  if (!emailConfigured()) return { sent: false, deliveryError: 'Email delivery is unavailable. Please try again later.' }
   try {
     await sendVerificationEmail(email, code)
     return { sent: true }
   } catch (err) {
-    return { sent: false, deliveryError: err.message, devCode: code }
+    console.error('[email-delivery]', err.message)
+    return { sent: false, deliveryError: 'Email delivery is unavailable. Please try again later.' }
   }
 }
 
-/** Send a password-reset code. `devCode` only when no provider is configured. */
+/** Send a password-reset code without disclosing it in the HTTP response. */
 async function deliverReset(email, code) {
-  if (!emailConfigured()) return { sent: false, devCode: code }
+  if (!emailConfigured()) return { sent: false, deliveryError: 'Email delivery is unavailable. Please try again later.' }
   try {
     await sendResetEmail(email, code)
     return { sent: true }
   } catch (err) {
-    return { sent: false, deliveryError: err.message, devCode: code }
+    console.error('[email-delivery]', err.message)
+    return { sent: false, deliveryError: 'Email delivery is unavailable. Please try again later.' }
   }
 }
 
@@ -253,6 +257,9 @@ async function handle(request, env) {
   const method = request.method
 
   if (method === 'OPTIONS') return new Response(null, { status: 204, headers: cors() })
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown'
+  if (path.startsWith('/auth/') && method === 'POST' && path !== '/auth/logout' &&
+      !rateLimit(`auth:${ip}:${path}`, 20)) return json({ error: 'Too many requests. Please try again later.' }, 429)
 
   // ── Auth ───────────────────────────────────────────────────────────────────
   if (path === '/auth/signup' && method === 'POST') {
@@ -262,7 +269,8 @@ async function handle(request, env) {
     const problem = credentialProblem(credential)
     if (problem) return json({ error: problem }, 400)
     const existing = await getUser(id)
-    if (existing?.email_verified) return json({ error: 'An account with that email already exists' }, 409)
+    if (existing && existing.email_verified !== false) return json({ error: 'An account with that email already exists' }, 409)
+    if (existing && resendCooldownRemaining(existing.verification_sent_at) > 0) return json({ error: 'Please wait before requesting another code' }, 429)
     const code = generateVerificationCode()
     const userId = existing?.id || crypto.randomUUID()
     await saveUser({
@@ -314,21 +322,7 @@ async function handle(request, env) {
   // RESEND_API_KEY out of the browser. Accounts created here do not use it.
   if (path === '/auth/send-code' && method === 'POST') {
     if (!mailerOriginAllowed(request)) return json({ sent: false, error: 'Origin not allowed' }, 403)
-    const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('x-forwarded-for') || 'unknown'
-    if (!rateLimit(`mail:${ip}`, 5)) return json({ sent: false, error: 'Too many codes requested — try again in a minute' }, 429)
-    const { email, code, name, kind } = await request.json().catch(() => ({}))
-    const to = String(email || '').trim().toLowerCase()
-    if (!/^\S+@\S+\.\S+$/.test(to)) return json({ sent: false, error: 'A valid email address is required' }, 400)
-    if (!/^\d{6}$/.test(String(code || ''))) return json({ sent: false, error: 'A 6-digit code is required' }, 400)
-    try {
-      // `kind: 'reset'` picks the reset wording, so a browser that keeps its accounts
-      // locally gets the same email a server-side account would.
-      const send = kind === 'reset' ? sendResetEmail : sendVerificationEmail
-      await send(to, String(code), name)
-      return json({ sent: true })
-    } catch (err) {
-      return json({ sent: false, error: err.message }, 502)
-    }
+    return json({ sent: false, error: 'Use the account verification service' }, 410)
   }
 
   // Send a replacement code (rate-limited so it can't be used to spam an inbox).
@@ -351,7 +345,7 @@ async function handle(request, env) {
     const body = await request.json().catch(() => ({}))
     const id = String(body.email || '').trim().toLowerCase()
     if (!/^\S+@\S+\.\S+$/.test(id)) return json({ error: 'Enter a valid email address' }, 400)
-    const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('x-forwarded-for') || 'unknown'
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown'
     if (!rateLimit(`reset:${ip}`, 5)) return json({ error: 'Too many reset requests — try again in a minute' }, 429)
     const user = await getUser(id)
     // Nothing to reset, so say nothing about it: the answer is the one an address with
@@ -368,7 +362,10 @@ async function handle(request, env) {
       reset_attempts: 0,
       reset_sent_at: new Date().toISOString(),
     })
-    return json({ ok: true, email: id, ...(await deliverReset(id, code)) })
+    await deliverReset(id, code)
+    // Never expose the reset code or provider outcome: neither is evidence of
+    // address ownership, and both reveal whether an account exists.
+    return json({ ok: true, email: id, sent: true })
   }
 
   // Finish a reset. The code proves the address and the new password is set with it,
@@ -410,12 +407,14 @@ async function handle(request, env) {
     const { identifier, credential } = await request.json()
     const problem = credentialProblem(credential)
     if (problem) return json({ error: problem }, 400)
-    const user = await getUser(String(identifier || '').trim().toLowerCase())
+    const id = String(identifier || '').trim().toLowerCase()
+    if (!rateLimit(`login-account:${id}`, 5, 15 * 60000)) return json({ error: 'Too many sign-in attempts. Try again in 15 minutes.' }, 429)
+    const user = await getUser(id)
     if (!user || !(await verifyPassword(credential, user.password_hash))) {
       return json({ error: 'Invalid email or password' }, 401)
     }
     // An unverified account gets no session — the client switches to the code screen.
-    if (!user.email_verified) return json({ pendingVerification: true, email: user.email }, 403)
+    if (user.email_verified === false) return json({ pendingVerification: true, email: user.email }, 403)
     return json({ token: await signToken(user), user: publicRow(user) })
   }
 
@@ -471,22 +470,13 @@ async function handle(request, env) {
     const entry = PRICE_MAP()[item]
     if (!entry) return json({ error: 'Unknown plan or add-on' }, 400)
 
-    // With no Stripe secret key there is nothing to charge, so the entitlement is
-    // granted here — that keeps the pricing flow demonstrable and switches itself
-    // off the moment a real key is set. Once Stripe *is* configured, an item with
-    // no price ID cannot be sold, and granting it anyway would hand out Premium
-    // for free: that is an error, not a discount.
-    if (!stripeConfigured()) {
-      const patch = isAddon(item)
-        ? { email: user.email, addons: [...new Set([...(user.addons || []), item])] }
-        : { email: user.email, plan: item }
-      const row = await saveUser(patch)
-      return json({ demo: true, user: publicRow(row) })
-    }
+    // Server billing always fails closed; only the development browser demo
+    // may simulate purchases. A missing key must never sell Premium for free.
+    if (!stripeConfigured()) return json({ error: 'Purchases are unavailable until billing is configured' }, 503)
     if (!entry.price) return json({ error: `Stripe is not set up for ${item} yet`, item }, 503)
 
     const session = await stripeCheckoutSession({
-      priceId: entry.price, userId: user.id, email: user.email, mode: entry.mode, item,
+      priceId: entry.price, userId: user.id, email: user.email, mode: entry.mode, item, customerId: user.stripe_customer_id,
     })
     return json({ url: session.url, id: session.id })
   }
@@ -497,7 +487,8 @@ async function handle(request, env) {
     const user = await authUser(request)
     if (!user) return json({ error: 'Unauthorised' }, 401)
     const { sessionId } = await request.json().catch(() => ({}))
-    if (!stripeConfigured() || !sessionId) return json({ demo: true })
+    if (!stripeConfigured()) return json({ error: 'Billing is unavailable' }, 503)
+    if (typeof sessionId !== 'string' || !/^cs_[A-Za-z0-9_]{1,200}$/.test(sessionId)) return json({ error: 'Invalid checkout session' }, 400)
 
     let session
     try {
@@ -507,30 +498,33 @@ async function handle(request, env) {
     }
     // Only the account that started the session may claim it — otherwise a
     // leaked session id would be a way to buy Premium for someone else's account.
-    if (session.client_reference_id && session.client_reference_id !== user.id) {
+    if (session.client_reference_id !== user.id || (session.metadata?.userId && session.metadata.userId !== user.id)) {
       return json({ error: 'Not your checkout session' }, 403)
     }
-    const paid = session.payment_status === 'paid' || session.status === 'complete'
+    const paid = session.payment_status === 'paid' && session.status === 'complete'
     if (!paid) return json({ pending: true })
-    const row = await grantPurchase(user, { item: session.metadata?.item, mode: session.mode, customerId: session.customer })
-    return json({ ok: true, user: publicRow(row || user) })
+    const row = await grantPurchase(user, session)
+    if (!row) return json({ error: 'Invalid purchase metadata' }, 400)
+    return json({ ok: true, user: publicRow(row) })
   }
   // Real invoices, straight from Stripe, so the dashboard's billing history is the
   // same record the customer sees in the portal.
   if (path === '/billing/invoices' && method === 'POST') {
     const user = await authUser(request)
     if (!user) return json({ error: 'Unauthorised' }, 401)
-    if (!stripeConfigured() || !user.stripe_customer_id) return json({ invoices: [] })
-    const rows = await stripeListInvoices(user.stripe_customer_id).catch(() => [])
+    const purchases = await listPurchases(user.id)
+    if (!stripeConfigured() || !user.stripe_customer_id) return json({ invoices: purchases })
+    const rows = await stripeListInvoices(user.stripe_customer_id)
+    const invoicedSubscriptions = new Set(rows.map((invoice) => invoice.subscription).filter(Boolean))
     return json({
-      invoices: rows.map((inv) => ({
+      invoices: [...purchases.filter((purchase) => !purchase.subscription || !invoicedSubscriptions.has(purchase.subscription)), ...rows.map((inv) => ({
         id: inv.id,
         item: inv.lines?.data?.[0]?.description || inv.description || 'MapMyCams',
         kind: inv.subscription ? 'subscription' : 'addon',
         amount: (inv.amount_paid || 0) / 100,
         status: inv.status || 'unknown',
         date: new Date((inv.created || 0) * 1000).toISOString(),
-      })),
+      }))],
     })
   }
   if (path === '/billing/portal' && method === 'POST') {
@@ -560,14 +554,22 @@ async function handle(request, env) {
     const sig = request.headers.get('Stripe-Signature') || ''
     if (!(await verifyStripeSignature(payload, sig, env.STRIPE_WEBHOOK_SECRET))) return json({ error: 'Bad signature' }, 400)
     const event = JSON.parse(payload)
-    if (event.type === 'checkout.session.completed') {
-      const s = event.data.object
-      const account = await findAccount(s.client_reference_id || s.metadata?.userId)
-      await grantPurchase(account, { item: s.metadata?.item, mode: s.mode, customerId: s.customer })
+    if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+      const s = event.data?.object
+      if (!s?.id) return json({ error: 'Invalid checkout event' }, 400)
+      const account = await findAccount(s.client_reference_id)
+      if (!account) return json({ error: 'Purchase account not found; retry delivery' }, 503)
+      // Delayed payment methods send completed before money settles.
+      if (s.payment_status === 'paid') {
+        if (!(await grantPurchase(account, s))) return json({ error: 'Invalid purchase metadata' }, 400)
+      }
     }
     if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.paused') {
-      const account = await findAccount(event.data.object.metadata?.userId)
-      if (account) await saveUser({ email: account.email, plan: 'free' })
+      const subscription = event.data.object
+      if (!subscription.id) return json({ error: 'Invalid subscription event' }, 400)
+      await writeJson(`subscription-ended:${subscription.id}`, { ended: Date.now() })
+      const account = await findAccount(subscription.metadata?.userId)
+      if (account && account.stripe_subscription_id === subscription.id) await saveUser({ email: account.email, plan: 'free' })
     }
     return json({ received: true })
   }
@@ -658,7 +660,7 @@ async function handle(request, env) {
       return json({ ok: true })
     }
     if (rest === '/comments' && method === 'GET') {
-      if (!record) return json({ error: 'This link is not valid' }, 404)
+      if (!live) return json({ error: 'This link is not valid or has expired' }, 404)
       const comments = await listShareComments(code)
       return json(comments.map(publicComment))
     }
@@ -774,6 +776,7 @@ async function handle(request, env) {
     const { userId, plan } = await request.json()
     const account = await findAccount(userId)
     if (!account) return json({ error: 'No such account' }, 404)
+    if (!['free', 'premium_monthly', 'premium_yearly'].includes(plan)) return json({ error: 'Unknown plan' }, 400)
     const row = await saveUser({ email: account.email, plan })
     return json(publicRow(row))
   }
@@ -791,10 +794,18 @@ async function handle(request, env) {
 /** Any unhandled failure answers with its message rather than an opaque 500. */
 async function dispatch(request, env) {
   try {
-    return await handle(request, env)
+    const response = await handle(request, env)
+    const origin = request.headers.get('Origin')
+    const allowed = [env.APP_URL || 'https://mapmycams.dev', 'https://mapmycams.pages.dev', env.ALLOWED_ORIGIN].filter(Boolean)
+    const headers = new Headers(response.headers)
+    headers.delete('Access-Control-Allow-Origin')
+    if (origin && allowed.includes(origin)) headers.set('Access-Control-Allow-Origin', origin)
+    headers.set('Vary', 'Origin')
+    return new Response(response.body, { status: response.status, headers })
   } catch (err) {
     globalThis.env = globalThis.env || env
-    return json({ error: err?.message || 'Server error' }, 500)
+    console.error('[api-error]', err?.message || 'Server error')
+    return json({ error: 'Server error. Please try again later.' }, 500)
   }
 }
 

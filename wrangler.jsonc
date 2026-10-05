@@ -36,6 +36,8 @@
       // /floorplans to the static handler, which answers 405.
       "/floorplans",
       "/floorplans/*",
+      "/shares",
+      "/shares/*",
       "/billing/*",
       "/webhooks/*",
       "/admin/*",

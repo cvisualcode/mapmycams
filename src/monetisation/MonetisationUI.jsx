@@ -684,7 +684,6 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing, onHo
   const ent = useEntitlements()
   const { buy, busy, notice, dismiss } = useCheckout()
   const [billing, setBilling] = useState([])
-  const [twoFA, setTwoFA] = useState(false)
   const [planBusy, setPlanBusy] = useState(null)
   const [planError, setPlanError] = useState('')
   async function managePlan(plan, action) {
@@ -707,7 +706,6 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing, onHo
 
   useEffect(() => {
     api.getBilling().then(setBilling).catch(() => setBilling([]))
-    if (ent.user?.twoFA) setTwoFA(true)
   }, [ent.user?.plan, ent.user?.addons?.length])
 
   const planLabel = ent.user?.isAdmin ? 'Admin (full access)' : ent.isPremium ? 'Premium — ' + ent.user.plan.replace('premium_', '') : 'Free'
@@ -793,10 +791,8 @@ export function Dashboard({ onOpenPlan, onNewPlan, onOpenEditor, onPricing, onHo
         <section className="dash-card">
           <h3>Account &amp; privacy</h3>
           <p className="spec-hint">Signed in as <strong>{ent.user?.identifier}</strong></p>
-          <label className="check-row">
-            <input type="checkbox" checked={twoFA} onChange={async () => setTwoFA(await api.toggle2FA())} />
-            Two-factor authentication (email codes)
-          </label>
+          <p className="spec-hint">Email verification protects account creation and password recovery. Two-factor sign-in is not currently supported.</p>
+          <p className="spec-hint">One-time add-ons stay linked to this account across devices and password resets. Subscription access lasts while the subscription is active.</p>
           <p className="spec-hint">GDPR: your floorplans are stored encrypted at rest. You can request full deletion at any time — deleting a plan removes it permanently.</p>
           <h3 style={{ marginTop: 20 }}>Add-ons</h3>
           {ADDONS.map((a) => {

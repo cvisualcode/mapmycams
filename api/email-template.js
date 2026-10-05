@@ -5,6 +5,10 @@
 // apart on purpose — "verify your email" is the wrong thing to read when what you
 // asked for was a new password.
 
+export function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char])
+}
+
 /**
  * Build the verification email for a 6-digit code.
  * @param {string} code   the 6-digit code to deliver
@@ -18,10 +22,10 @@ export function verificationEmail(code, name = '') {
     text: `${hello}\n\nYour MapMyCams verification code is ${code}.\n\n`
       + 'It expires in 10 minutes. If you did not create an account, you can ignore this email.',
     html: '<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:480px;color:#0f172a">'
-      + `<p style="margin:0 0 12px;color:#475569">${hello}</p>`
+      + `<p style="margin:0 0 12px;color:#475569">${escapeHtml(hello)}</p>`
       + '<h2 style="margin:0 0 12px">Verify your email</h2>'
       + '<p style="color:#475569;margin:0 0 16px">Enter this code to finish creating your MapMyCams account.</p>'
-      + `<p style="font-size:32px;font-weight:700;letter-spacing:6px;margin:0 0 16px">${code}</p>`
+      + `<p style="font-size:32px;font-weight:700;letter-spacing:6px;margin:0 0 16px">${escapeHtml(code)}</p>`
       + '<p style="color:#64748b;font-size:13px;margin:0">It expires in 10 minutes. '
       + 'If you did not create an account, you can ignore this email.</p>'
       + '</div>',
@@ -43,10 +47,10 @@ export function passwordResetEmail(code, name = '') {
       + 'Enter it on the reset screen to choose a new password. It expires in 10 minutes, and you can ignore\n'
       + 'this email if you did not ask for it — nothing has changed.',
     html: '<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:480px;color:#0f172a">'
-      + `<p style="margin:0 0 12px;color:#475569">${hello}</p>`
+      + `<p style="margin:0 0 12px;color:#475569">${escapeHtml(hello)}</p>`
       + '<h2 style="margin:0 0 12px">Choose a new password</h2>'
       + '<p style="color:#475569;margin:0 0 16px">Enter this code on the reset screen to set a new password for your MapMyCams account.</p>'
-      + `<p style="font-size:32px;font-weight:700;letter-spacing:6px;margin:0 0 16px">${code}</p>`
+      + `<p style="font-size:32px;font-weight:700;letter-spacing:6px;margin:0 0 16px">${escapeHtml(code)}</p>`
       + '<p style="color:#64748b;font-size:13px;margin:0">It expires in 10 minutes. If you did not ask for a reset, '
       + 'you can ignore this email — nothing about your account has changed.</p>'
       + '</div>',
