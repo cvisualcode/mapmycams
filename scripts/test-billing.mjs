@@ -41,10 +41,16 @@ function memoryKV() {
 
 // ── Stripe, stubbed: records what the app asked for and answers like Stripe ──
 const stripeCalls = []
+const outbox = []
 let nextSession = null
 const realFetch = globalThis.fetch
 globalThis.fetch = async (url, init = {}) => {
   const full = String(url)
+  if (full === 'https://api.resend.com/emails') {
+    const message = JSON.parse(init.body)
+    outbox.push(message.text.match(/\b\d{6}\b/)[0])
+    return Response.json({ id: 'email_test' })
+  }
   if (!full.startsWith('https://api.stripe.com/')) throw new Error(`unexpected network call to ${full}`)
   const path = full.replace('https://api.stripe.com/v1/', '').split('?')[0]
   const body = init.body ? Object.fromEntries(new URLSearchParams(init.body)) : null
@@ -69,6 +75,7 @@ const env = {
   AUTH_SECRET: 'smoke-test-secret-0123456789-abcdefghijkl',
   MAPMYCAMS_STORE: memoryKV(),
   APP_URL: 'https://mapmycams.dev',
+  RESEND_API_KEY: 're_test', EMAIL_FROM: 'Test <test@mapmycams.dev>',
 }
 
 let failures = 0
@@ -95,7 +102,7 @@ const credential = (seed = 1) => `pbkdf2$sha256$210000$${btoa(`salt-${seed}`)}$$
 
 async function createAccount(email) {
   const signup = await call('/auth/signup', { body: { email, credential: credential(email.length), name: email.split('@')[0] } })
-  const verify = await call('/auth/verify', { body: { email, code: signup.data?.devCode } })
+  const verify = await call('/auth/verify', { body: { email, code: outbox.at(-1) } })
   return { signup, verify, token: verify.data?.token }
 }
 
@@ -107,11 +114,11 @@ check('verifying issues a session', Boolean(alice.token), JSON.stringify(alice.v
 check('a new account starts on Free', alice.verify.data?.user?.plan === 'free')
 
 const demoPlan = await call('/billing/checkout', { token: alice.token, body: { item: 'premium_monthly', kind: 'plan' } })
-check('checkout grants the plan locally', demoPlan.data?.demo === true && demoPlan.data?.user?.plan === 'premium_monthly')
+check('missing Stripe config refuses checkout instead of granting a free plan', demoPlan.status === 503)
 
 await call('/billing/cancel', { token: alice.token })
 const demoAddon = await call('/billing/checkout', { token: alice.token, body: { item: 'ai_pack', kind: 'addon' } })
-check('checkout grants an add-on locally', (demoAddon.data?.user?.addons || []).includes('ai_pack'))
+check('missing Stripe config refuses add-ons too', demoAddon.status === 503)
 
 const demoInvoices = await call('/billing/invoices', { token: alice.token })
 check('no Stripe customer means no invoices', Array.isArray(demoInvoices.data?.invoices) && demoInvoices.data.invoices.length === 0)
@@ -151,26 +158,26 @@ check('an unknown item is refused', unknown.status === 400)
 
 // ── 3 · Confirming the purchase on the way back ──────────────────────────────
 console.log('\nConfirming a purchase')
-nextSession = { id: 'cs_other', client_reference_id: 'someone-else', payment_status: 'paid', metadata: { item: 'premium_yearly' } }
+nextSession = { id: 'cs_other', client_reference_id: 'someone-else', payment_status: 'paid', metadata: { item: 'premium_yearly', userId: alice.verify.data?.user?.id } }
 const notYours = await call('/billing/confirm', { token: alice.token, body: { sessionId: 'cs_other' } })
 check("another account's session cannot be claimed", notYours.status === 403)
 
-nextSession = { id: 'cs_unpaid', client_reference_id: alice.verify.data?.user?.id, payment_status: 'unpaid', status: 'open', metadata: { item: 'premium_yearly' } }
+nextSession = { id: 'cs_unpaid', client_reference_id: alice.verify.data?.user?.id, payment_status: 'unpaid', status: 'open', metadata: { item: 'premium_yearly', userId: alice.verify.data?.user?.id } }
 const unpaid = await call('/billing/confirm', { token: alice.token, body: { sessionId: 'cs_unpaid' } })
 check('an unpaid session grants nothing yet', unpaid.data?.pending === true)
 
-nextSession = { id: 'cs_paid', client_reference_id: alice.verify.data?.user?.id, payment_status: 'paid', status: 'complete', mode: 'subscription', customer: 'cus_test_1', metadata: { item: 'premium_yearly' } }
+nextSession = { id: 'cs_paid', client_reference_id: alice.verify.data?.user?.id, payment_status: 'paid', status: 'complete', mode: 'subscription', customer: 'cus_test_1', subscription: 'sub_alice', metadata: { item: 'premium_yearly', userId: alice.verify.data?.user?.id } }
 const confirmed = await call('/billing/confirm', { token: alice.token, body: { sessionId: 'cs_paid' } })
 check('a paid subscription confirms the plan', confirmed.data?.user?.plan === 'premium_yearly', JSON.stringify(confirmed.data))
 check('the Stripe customer is remembered, so the portal can open', (await env.MAPMYCAMS_STORE.get('user:alice@example.com', 'json'))?.stripe_customer_id === 'cus_test_1')
 
-nextSession = { id: 'cs_addon', client_reference_id: alice.verify.data?.user?.id, payment_status: 'paid', status: 'complete', mode: 'payment', customer: 'cus_test_1', metadata: { item: 'pdf_report' } }
+nextSession = { id: 'cs_addon', client_reference_id: alice.verify.data?.user?.id, payment_status: 'paid', status: 'complete', mode: 'payment', customer: 'cus_test_1', metadata: { item: 'pdf_report', userId: alice.verify.data?.user?.id } }
 const confirmedAddon = await call('/billing/confirm', { token: alice.token, body: { sessionId: 'cs_addon' } })
 check('a paid add-on confirms the add-on', (confirmedAddon.data?.user?.addons || []).includes('pdf_report'), JSON.stringify(confirmedAddon.data))
 
 const paidInvoices = await call('/billing/invoices', { token: alice.token })
-check('invoices now come from Stripe', paidInvoices.data?.invoices?.[0]?.item === 'MapMyCams Premium (Monthly)', JSON.stringify(paidInvoices.data))
-check('invoice amounts are in pounds', paidInvoices.data?.invoices?.[0]?.amount === 4.99)
+check('invoices now come from Stripe', paidInvoices.data?.invoices?.some((invoice) => invoice.item === 'MapMyCams Premium (Monthly)'), JSON.stringify(paidInvoices.data))
+check('invoice amounts are in pounds', paidInvoices.data?.invoices?.some((invoice) => invoice.item === 'MapMyCams Premium (Monthly)' && invoice.amount === 4.99))
 
 const cancelPaid = await call('/billing/cancel', { token: alice.token })
 check('cancelling a paid subscription goes through Stripe', cancelPaid.status === 409 && String(cancelPaid.data?.url || '').startsWith('https://billing.stripe.com/'), JSON.stringify(cancelPaid.data))
@@ -183,7 +190,7 @@ const bobId = bob.verify.data?.user?.id
 async function postWebhook(event, secret = WEBHOOK_SECRET) {
   const payload = JSON.stringify(event)
   const t = Math.floor(Date.now() / 1000)
-  const v1 = createHmac('sha256', secret).update(`${t}.${payload}`).digest('base64url')
+  const v1 = createHmac('sha256', secret).update(`${t}.${payload}`).digest('hex')
   const request = new Request('https://mapmycams.dev/webhooks/stripe', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'Stripe-Signature': `t=${t},v1=${v1}` }, body: payload,
   })
@@ -194,16 +201,16 @@ async function postWebhook(event, secret = WEBHOOK_SECRET) {
 const forged = await postWebhook({ type: 'checkout.session.completed', data: { object: { client_reference_id: bobId, mode: 'payment', metadata: { item: 'brands' } } } }, 'whsec_wrong')
 check('a forged signature is rejected', forged.status === 400)
 
-const granted = await postWebhook({ type: 'checkout.session.completed', data: { object: { client_reference_id: bobId, mode: 'payment', customer: 'cus_bob', metadata: { item: 'brands' } } } })
+const granted = await postWebhook({ type: 'checkout.session.completed', data: { object: { id: 'cs_bob_addon', client_reference_id: bobId, payment_status: 'paid', status: 'complete', mode: 'payment', customer: 'cus_bob', metadata: { item: 'brands', userId: bobId } } } })
 check('the webhook is accepted', granted.status === 200 && granted.data?.received === true)
 const bobAfter = await call('/me', { method: 'GET', token: bob.token })
 check('the webhook grants the add-on', (bobAfter.data?.addons || []).includes('brands'), JSON.stringify(bobAfter.data))
 
-await postWebhook({ type: 'checkout.session.completed', data: { object: { client_reference_id: bobId, mode: 'subscription', customer: 'cus_bob', metadata: { item: 'premium_monthly' } } } })
+await postWebhook({ type: 'checkout.session.completed', data: { object: { id: 'cs_bob_plan', client_reference_id: bobId, payment_status: 'paid', status: 'complete', mode: 'subscription', customer: 'cus_bob', subscription: 'sub_bob', metadata: { item: 'premium_monthly', userId: bobId } } } })
 const bobPremium = await call('/me', { method: 'GET', token: bob.token })
 check('the webhook grants a subscription plan', bobPremium.data?.plan === 'premium_monthly')
 
-await postWebhook({ type: 'customer.subscription.deleted', data: { object: { metadata: { userId: bobId } } } })
+await postWebhook({ type: 'customer.subscription.deleted', data: { object: { id: 'sub_bob', metadata: { userId: bobId } } } })
 const bobCancelled = await call('/me', { method: 'GET', token: bob.token })
 check('a cancelled subscription drops back to Free', bobCancelled.data?.plan === 'free')
 

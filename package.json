@@ -33,7 +33,9 @@
     "pick:test": "node scripts/test-pick.mjs",
     "reset:test": "node scripts/test-reset.mjs",
     "visibility:test": "node scripts/test-visibility.mjs",
-    "demo-admin:test": "node scripts/test-demo-admin.mjs"
+    "demo-admin:test": "node scripts/test-demo-admin.mjs",
+    "security:test": "node scripts/test-security.mjs",
+    "browser:security": "node scripts/browser-security.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",

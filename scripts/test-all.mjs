@@ -27,6 +27,7 @@ const SUITES = [
   ['coverage:test', 'test-coverage.mjs'],
   ['ai:test', 'test-ai.mjs'],
   ['billing:test', 'test-billing.mjs'],
+  ['security:test', 'test-security.mjs'],
   ['checkout:test', 'test-checkout-client.mjs'],
   ['reset:test', 'test-reset.mjs'],
   ['visibility:test', 'test-visibility.mjs'],
@@ -51,7 +52,7 @@ for (const [name, file] of SUITES) {
   console.log(`${ok ? '✓' : '✗'} ${name.padEnd(16)} ${String(passes).padStart(3)} checks  ${seconds}s`)
   if (!ok) {
     for (const line of failed.slice(0, 10)) console.log(`    ${line}`)
-    if (!failed.length && run.error) console.log(`    ${String(run.error).split('\n')[0]}`)
+    if (!failed.length) console.log(output.slice(-4000) || String(run.error || `Exit status: ${run.status}`))
   }
 }
 

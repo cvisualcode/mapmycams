@@ -10,6 +10,9 @@
 // to the Vite dev server, so server calls there report "no server" and the local
 // account store takes over — see apiRaw().
 const API_URL = ((typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL) || '').replace(/\/+$/, '')
+// A missing/broken API on a production site is an outage, never demo permission.
+const productionAccountHost = Boolean(API_URL || import.meta.env?.PROD ||
+  /^(mapmycams\.dev|mapmycams\.pages\.dev)$/.test(globalThis.window?.location?.hostname || ''))
 // Where the verification code is actually emailed from. The default is the same
 // origin, which is where the deployed worker serves /auth/send-code. Override
 // with VITE_MAILER_URL if the API lives on another host.
@@ -481,10 +484,10 @@ async function apiRaw(path, body) {
       method: 'POST', headers: serverHeaders(), body: body ? JSON.stringify(body) : undefined,
     })
     const type = res.headers.get('content-type') || ''
-    if (!type.includes('application/json')) return { server: false, ok: false, status: res.status, data: {} }
+    if (!type.includes('application/json')) return { server: productionAccountHost, ok: false, status: 503, data: { error: 'Account service unavailable. Please try again later.' } }
     return { server: true, ok: res.ok, status: res.status, data: await res.json().catch(() => ({})) }
-  } catch (err) {
-    return { server: false, ok: false, status: 0, data: { error: err.message } }
+  } catch {
+    return { server: productionAccountHost, ok: false, status: 503, data: { error: 'Account service unavailable. Please try again later.' } }
   }
 }
 
@@ -581,7 +584,7 @@ export async function login(identifier, password) {
     // The server doesn't know this account — but one created here before the
     // server existed, or on a host that has none, is still valid in this browser.
     // A wrong password fails both ways, so this cannot sign anyone in falsely.
-    const local = await loginLocally(id, password, { allowDemoAdmin: await demoAdminAllowed() }).catch(() => null)
+    const local = productionAccountHost ? null : await loginLocally(id, password, { allowDemoAdmin: await demoAdminAllowed() }).catch(() => null)
     if (local) return local
     throw new Error(live.data.error || 'Invalid email/username or password')
   }
@@ -914,6 +917,7 @@ export async function getMe() {
       else return null
     }
   }
+  if (productionAccountHost) { clearSession(); return null }
   const local = publicUser(sessionUser())
   // A session for the seeded Admin predates the account service, and on a
   // deployed host it would be a standing free pass to every paid feature. Drop it
@@ -932,13 +936,12 @@ export async function getMe() {
  * account has a customer there; otherwise the local demo store answers.
  */
 export async function getBilling() {
-  const user = sessionUser()
-  if (!user) return []
   try {
     const res = await api('/billing/invoices', {})
     if (Array.isArray(res?.invoices)) return res.invoices
   } catch (e) { if (e.message !== 'demo') throw e }
-  return loadDB().billing[user.id] || []
+  const user = sessionUser()
+  return user ? loadDB().billing[user.id] || [] : []
 }
 
 /**
@@ -974,7 +977,7 @@ let apiProbe = null
 export function apiProbeResult() {
   if (apiProbe === null) {
     apiProbe = fetch(`${API_URL}/me`, { headers: serverHeaders() })
-      .then((res) => ((res.headers.get('content-type') || '').includes('application/json') ? 'api' : 'no-api'))
+      .then((res) => ((res.headers.get('content-type') || '').includes('application/json') ? 'api' : productionAccountHost ? 'unknown' : 'no-api'))
       .catch(() => 'unknown')
   }
   return apiProbe
@@ -1025,7 +1028,9 @@ export async function startCheckout(itemKey, kind = 'plan') {
   // for the second case by verifying the address first, so say so rather than
   // unlocking something the server will never know about.
   if (!serverToken()) {
-    if (await apiAvailable()) {
+    const mode = await apiProbeResult()
+    if (mode === 'unknown') throw new Error('Account service unavailable. No purchase was granted; please try again later.')
+    if (mode === 'api') {
       // The server can charge a card, but only for an account it knows about, and
       // this browser's account predates that. Rather than a dead end, hand the
       // caller something it can act on: the account gate creates and verifies the

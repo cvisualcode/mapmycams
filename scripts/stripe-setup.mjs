@@ -30,7 +30,7 @@ const CATALOGUE = [
   { item: 'brands', env: 'PRICE_BRANDS', name: 'Camera Brand Integration Pack', amount: 699 },
 ]
 
-const EVENTS = ['checkout.session.completed', 'customer.subscription.deleted', 'customer.subscription.paused']
+const EVENTS = ['checkout.session.completed', 'checkout.session.async_payment_succeeded', 'customer.subscription.deleted', 'customer.subscription.paused']
 
 // Stripe classifies what it is selling, which is what decides the tax applied.
 // Every price here is a plan or an add-on in the web app, so: SaaS, personal use.
